@@ -1,0 +1,32 @@
+# kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o.d
+.*.cmd
+*.order
+modules.order
+Module.symvers
+.tmp_versions/
+
+# python
+__pycache__/
+*.py[co]
+
+# rpm build trees / outputs
+rpmbuild/
+_rpm/
+BUILD/
+BUILDROOT/
+RPMS/
+SRPMS/
+SOURCES/*.tar.gz
+*.rpm
+*.src.rpm
+
+# editors / misc
+*.swp
+*~
+.DS_Store

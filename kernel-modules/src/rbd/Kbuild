@@ -1,0 +1,3 @@
+LINUXINCLUDE := -I$(src)/include $(LINUXINCLUDE)
+obj-m += rbd.o
+ccflags-y := -include $(src)/compat-4.19.h

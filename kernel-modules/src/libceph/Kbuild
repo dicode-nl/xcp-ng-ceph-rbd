@@ -1,0 +1,16 @@
+# Prepend our curated include dir so CS9 (5.14) ceph/crush/krb5 headers win
+# over the 4.19 in-tree copies, while everything else still comes from 4.19.
+LINUXINCLUDE := -I$(src)/include $(LINUXINCLUDE)
+
+obj-m += libceph.o
+libceph-y := ceph_common.o messenger.o msgpool.o buffer.o pagelist.o \
+	mon_client.o decode.o cls_lock_client.o \
+	osd_client.o osdmap.o crush/crush.o crush/mapper.o crush/hash.o \
+	striper.o debugfs.o auth.o auth_none.o \
+	crypto.o armor.o auth_x.o \
+	ceph_strings.o ceph_hash.o \
+	pagevec.o snapshot.o string_table.o \
+	messenger_v1.o messenger_v2.o \
+	compat_fs_parser.o
+
+ccflags-y := -include $(src)/compat-4.19.h

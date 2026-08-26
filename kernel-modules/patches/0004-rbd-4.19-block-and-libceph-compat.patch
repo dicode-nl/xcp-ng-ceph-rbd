@@ -1,0 +1,65 @@
+--- a/rbd/rbd.c	2026-08-21 15:05:26.955004483 +0200
++++ b/rbd/rbd.c	2026-08-21 14:56:00.129066694 +0200
+@@ -1309,7 +1309,8 @@
+ 	dout("%s osd_req %p for obj_req %p objno %llu %llu~%llu\n",
+ 	     __func__, osd_req, obj_req, obj_req->ex.oe_objno,
+ 	     obj_req->ex.oe_off, obj_req->ex.oe_len);
+-	ceph_osdc_start_request(osd_req->r_osdc, osd_req, false);
++	/* compat: CS9 libceph dropped the nofail arg from ceph_osdc_start_request() */
++	ceph_osdc_start_request(osd_req->r_osdc, osd_req);
+ }
+ 
+ /*
+@@ -2093,7 +2094,7 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ceph_osdc_start_request(osdc, req, false);
++	ceph_osdc_start_request(osdc, req);	/* compat: no nofail arg on CS9 */
+ 	return 0;
+ }
+ 
+@@ -4781,7 +4782,7 @@
+ 	if (ret)
+ 		goto out_req;
+ 
+-	ceph_osdc_start_request(osdc, req, false);
++	ceph_osdc_start_request(osdc, req);	/* compat: no nofail arg on CS9 */
+ 	ret = ceph_osdc_wait_request(osdc, req);
+ 	if (ret >= 0)
+ 		ceph_copy_from_page_vector(pages, buf, 0, ret);
+@@ -4963,7 +4964,12 @@
+ 	}
+ 
+ 	if (!ceph_test_opt(rbd_dev->rbd_client->client, NOCRC))
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+ 		blk_queue_flag_set(QUEUE_FLAG_STABLE_WRITES, q);
++#else
++		/* compat: pre-5.7 stable-writes was a bdi capability */
++		q->backing_dev_info->capabilities |= BDI_CAP_STABLE_WRITES;
++#endif
+ 
+ 	rbd_dev->disk = disk;
+ 
+@@ -6509,7 +6515,8 @@
+ 	pctx.opts->exclusive = RBD_EXCLUSIVE_DEFAULT;
+ 	pctx.opts->trim = RBD_TRIM_DEFAULT;
+ 
+-	ret = ceph_parse_mon_ips(mon_addrs, mon_addrs_size, pctx.copts, NULL);
++	/* compat: CS9 libceph added a delimiter arg to ceph_parse_mon_ips() */
++	ret = ceph_parse_mon_ips(mon_addrs, mon_addrs_size, pctx.copts, NULL, ',');
+ 	if (ret)
+ 		goto out_err;
+ 
+@@ -7066,7 +7073,11 @@
+ 	if (rc)
+ 		goto err_out_image_lock;
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
+ 	device_add_disk(&rbd_dev->dev, rbd_dev->disk, NULL);
++#else
++	device_add_disk(&rbd_dev->dev, rbd_dev->disk);	/* compat: 2-arg, no groups */
++#endif
+ 
+ 	spin_lock(&rbd_dev_list_lock);
+ 	list_add_tail(&rbd_dev->node, &rbd_dev_list);

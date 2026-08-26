@@ -1,0 +1,12 @@
+--- a/include/linux/ceph/messenger.h	2026-08-21 12:16:04.982463600 +0200
++++ b/libceph/include/linux/ceph/messenger.h	2026-08-21 14:29:49.099947697 +0200
+@@ -397,6 +397,9 @@
+ 	struct bio_vec in_bvec;  /* recvmsg (in_cursor) */
+ 	int in_kvec_cnt;
+ 	int in_state;  /* IN_S_* */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++	int in_skip_resid;  /* compat: bytes still to discard (no ITER_DISCARD) */
++#endif
+ 
+ 	struct iov_iter out_iter;
+ 	struct kvec out_kvecs[8];  /* sendmsg */

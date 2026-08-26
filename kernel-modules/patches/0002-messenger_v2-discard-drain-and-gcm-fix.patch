@@ -1,0 +1,109 @@
+--- a/net/ceph/messenger_v2.c	2026-08-21 12:16:05.016426504 +0200
++++ b/libceph/messenger_v2.c	2026-08-21 18:33:59.848026820 +0200
+@@ -106,6 +106,32 @@
+  *   0 - socket is empty, need to wait
+  *  <0 - error
+  */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++/*
++ * compat: 4.19 has no ITER_DISCARD. The msgr2 read machine requires in_iter to
++ * always have a non-zero count after a state is processed (populate_in_iter()
++ * and ceph_con_v2_try_read() WARN_ON(!count) -> -ENODATA). So a skip cannot
++ * leave in_iter empty; instead we drain the skipped bytes into a shared
++ * write-only throwaway page via a bvec iter, in PAGE_SIZE chunks re-armed by
++ * set_in_skip()/finish_skip(). The page holds garbage we never read, so it is
++ * safe to share across connections.
++ */
++static struct page *ceph_v2_skip_page;
++
++static struct page *get_skip_page(void)
++{
++	struct page *p = READ_ONCE(ceph_v2_skip_page);
++
++	if (!p) {
++		p = alloc_page(GFP_NOIO);
++		if (p && cmpxchg(&ceph_v2_skip_page, NULL, p))
++			__free_page(p);	/* lost the race; use the winner */
++		p = READ_ONCE(ceph_v2_skip_page);
++	}
++	return p;
++}
++#endif
++
+ static int ceph_tcp_recv(struct ceph_connection *con)
+ {
+ 	int ret;
+@@ -238,12 +264,35 @@
+ 	iov_iter_bvec(&con->v2.in_iter, READ, &con->v2.in_bvec, 1, bv->bv_len);
+ }
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++/* Arm one chunk of a skip: point in_iter at the shared skip page for up to one
++ * page of the remaining skip length. do_recvmsg() drains it; finish_skip()
++ * re-arms until in_skip_resid reaches 0. Keeps in_iter non-empty (invariant). */
++static void arm_skip_chunk(struct ceph_connection *con)
++{
++	struct bio_vec bv;
++	int n = min_t(int, con->v2.in_skip_resid, (int)PAGE_SIZE);
++
++	bv.bv_page = get_skip_page();
++	bv.bv_offset = 0;
++	bv.bv_len = n;
++	set_in_bvec(con, &bv);
++	con->v2.in_skip_resid -= n;
++}
++#endif
++
+ static void set_in_skip(struct ceph_connection *con, int len)
+ {
+ 	WARN_ON(iov_iter_count(&con->v2.in_iter));
+ 
+ 	dout("%s con %p len %d\n", __func__, con, len);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++	/* compat: no ITER_DISCARD — drain into the shared skip page in chunks. */
++	con->v2.in_skip_resid = len;
++	arm_skip_chunk(con);
++#else
+ 	iov_iter_discard(&con->v2.in_iter, READ, len);
++#endif
+ }
+ 
+ static void add_out_kvec(struct ceph_connection *con, void *buf, int len)
+@@ -755,7 +804,22 @@
+ 	}
+ 
+ 	noio_flag = memalloc_noio_save();
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
++	/*
++	 * compat: 4.19's fused aesni gcmaes linearizes large multi-segment SG
++	 * into a single kmalloc_order() of the whole crypt length; for >=4MB
++	 * frames (RBD 4MB objects) that is order 10/11 which exceeds MAX_ORDER,
++	 * fails, and breaks msgr2 secure decrypt. Force the generic gcm template
++	 * (streaming skcipher+ahash over the SG, no big linear alloc) built on
++	 * hardware-accelerated primitives ctr(aes)+ghash. GCM output is
++	 * algorithm-defined so this is byte-compatible.
++	 */
++	con->v2.gcm_tfm = crypto_alloc_aead("gcm_base(ctr(aes),ghash)", 0, 0);
++	if (IS_ERR(con->v2.gcm_tfm))	/* fallback if that instantiation is unavailable */
++		con->v2.gcm_tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
++#else
+ 	con->v2.gcm_tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
++#endif
+ 	memalloc_noio_restore(noio_flag);
+ 	if (IS_ERR(con->v2.gcm_tfm)) {
+ 		ret = PTR_ERR(con->v2.gcm_tfm);
+@@ -3089,6 +3153,14 @@
+ {
+ 	dout("%s con %p\n", __func__, con);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
++	/* compat: more skip bytes remain -> arm the next chunk and stay in
++	 * IN_S_FINISH_SKIP; only finalize (nonce/seq bump) once fully drained. */
++	if (con->v2.in_skip_resid > 0) {
++		arm_skip_chunk(con);
++		return;
++	}
++#endif
+ 	if (con_secure(con))
+ 		gcm_inc_nonce(&con->v2.in_gcm_nonce);
+ 

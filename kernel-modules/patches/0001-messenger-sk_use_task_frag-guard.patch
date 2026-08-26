@@ -1,0 +1,13 @@
+--- a/net/ceph/messenger.c	2026-08-21 12:16:05.016426504 +0200
++++ b/libceph/messenger.c	2026-08-21 14:02:13.553318812 +0200
+@@ -450,7 +450,9 @@
+ 	if (ret)
+ 		return ret;
+ 	sock->sk->sk_allocation = GFP_NOFS;
+-	sock->sk->sk_use_task_frag = false;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
++	sock->sk->sk_use_task_frag = false;	/* compat: field added in 6.2 */
++#endif
+ 
+ #ifdef CONFIG_LOCKDEP
+ 	lockdep_set_class(&sock->sk->sk_lock, &socket_class);
