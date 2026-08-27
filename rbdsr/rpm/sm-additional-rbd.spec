@@ -6,7 +6,7 @@
 
 Name:           sm-additional-rbd
 Version:        2.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Ceph RBD Storage Repository driver for XCP-ng (native krbd + ceph-mgr dashboard API)
 
 License:        LGPL-2.1-only
@@ -86,6 +86,12 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 27 2026 dicode <info@dicode.nl> - 2.0-3
+- GC: flatten a child only when it frees the parent snap (deep-flatten, or no
+  child snapshots); otherwise defer (works on stock-rbd images w/o deep-flatten).
+- rbd_features preset: performance (default) | compat; layering always enforced.
+- ms_mode default changed secure -> prefer-crc (crc where allowed, else secure).
+
 * Thu Aug 27 2026 dicode <info@dicode.nl> - 2.0-2
 - rbd_backend.list_images now filters by namespace (the dashboard returns every
   image in the pool); prevents a 2nd SR on the same pool leaking VDIs into scan.

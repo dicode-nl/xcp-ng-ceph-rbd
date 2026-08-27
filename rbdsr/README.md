@@ -31,7 +31,9 @@ live-migration on a shared SR works.
 ## device-config
 
 `pool`, `mon_host`, `user`, `key` (cephx aes256k secret — datapath only),
-`namespace` (default: SR uuid), `ms_mode` (default: secure), `rbd_features`,
+`namespace` (default: SR uuid), `ms_mode` (default: prefer-crc — crc where the
+cluster allows it, else secure; `secure` forces wire encryption), `rbd_features`
+(preset `performance` (default) | `compat`, or an explicit comma-list),
 `api_url` (dashboard), `api_user`, `api_secret` (dashboard account — NOT the
 cephx key), `api_tls_verify`, `backend_kind` (default: vbd).
 

@@ -23,6 +23,27 @@ UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 
 
+# rbd_features presets (device-config:rbd_features). 'layering' is always enforced
+# (clones need it). 'performance' needs a krbd that maps object-map/fast-diff (5.3+);
+# 'compat' maps on older/stock clients (4.9+) but is slower and has no deep-flatten
+# (GC then defers, see rbd_gc.py). An explicit comma-list is an advanced override.
+RBD_FEATURE_PRESETS = {
+    "performance": ["layering", "exclusive-lock", "object-map", "fast-diff", "deep-flatten"],
+    "compat": ["layering", "exclusive-lock"],
+}
+
+
+def resolve_features(value):
+    v = (value or "performance").strip()
+    preset = RBD_FEATURE_PRESETS.get(v.lower())
+    if preset is not None:
+        return list(preset)
+    feats = [f.strip() for f in v.split(",") if f.strip()]
+    if "layering" not in feats:
+        feats.insert(0, "layering")
+    return feats
+
+
 def backend(meta):
     return make_backend(meta["dconf"])
 

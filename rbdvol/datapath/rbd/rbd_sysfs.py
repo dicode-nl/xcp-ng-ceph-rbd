@@ -85,7 +85,7 @@ def _normalize_mons(mon_host, ms_mode):
 
 
 def _build_spec(mon_host, user, secret, pool, image, snap=None,
-                ms_mode="secure", read_only=False, extra_opts=None, namespace=None):
+                ms_mode="prefer-crc", read_only=False, extra_opts=None, namespace=None):
     """Build the krbd sysfs 'add' line: '<mons> <options> <pool> <image> [<snap>]'.
     Namespaced images use the krbd '_pool_ns=<ns>' option (our rbd.c Opt_pool_ns)."""
     mons = _normalize_mons(mon_host, ms_mode)
@@ -148,7 +148,7 @@ def _device_for_id(dev_id):
 
 
 def map_image(mon_host, user, secret, pool, image, snap=None,
-              ms_mode="secure", read_only=False, extra_opts=None, namespace=None):
+              ms_mode="prefer-crc", read_only=False, extra_opts=None, namespace=None):
     """Map an RBD image/snapshot; return its /dev/rbdN. Idempotent."""
     existing = find_device(pool, image, snap, namespace)
     if existing:

@@ -57,7 +57,9 @@ lib ships only for python2 on 8.3).
 
 Namespace == SR uuid, image == VDI uuid, snapshot volume key == `<base>@<snap_uuid>`
 (same as the SMAPIv1 driver). `device-config`: `pool`, `mon_host`, `user`, `key`
-(cephx aes256k — datapath only), `ms_mode` (secure), `rbd_features`, `namespace`
+(cephx aes256k — datapath only), `ms_mode` (default: prefer-crc — crc where the
+cluster allows it, else secure), `rbd_features` (preset
+`performance` (default) | `compat`, or an explicit comma-list), `namespace`
 (default: SR uuid), `api_url`/`api_user`/`api_secret`/`api_tls_verify` (dashboard),
 `datapath` (blkback|tapdisk).
 

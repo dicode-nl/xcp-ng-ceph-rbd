@@ -26,10 +26,7 @@ def _gen_uuid():
 
 
 def _features(meta):
-    f = meta["dconf"].get(
-        "rbd_features",
-        "layering,exclusive-lock,object-map,fast-diff,deep-flatten")
-    return [x.strip() for x in f.split(",") if x.strip()]
+    return lib.resolve_features(meta["dconf"].get("rbd_features"))
 
 
 def _flatten_children(be, pool, ns, base_image, snap_name=None):

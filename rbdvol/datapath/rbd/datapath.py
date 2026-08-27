@@ -82,7 +82,7 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
         read_only = snap is not None                 # snapshots are read-only
         dev = rbd_sysfs.map_image(
             dconf["mon_host"], dconf.get("user", "admin"), dconf["key"],
-            pool, image, snap=snap, ms_mode=dconf.get("ms_mode", "secure"),
+            pool, image, snap=snap, ms_mode=dconf.get("ms_mode", "prefer-crc"),
             read_only=read_only, namespace=ns)
         if mode == "tapdisk":
             tapdev = _tap_create(dev, read_only=read_only)

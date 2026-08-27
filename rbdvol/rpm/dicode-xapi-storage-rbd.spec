@@ -11,7 +11,7 @@
 # (cf. xcp-ng-xapi-storage-volume-zfsvol / -datapath-tapdisk) plus a thin meta.
 Name:           dicode-xapi-storage-rbd
 Version:        0.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Ceph RBD SMAPIv3 storage plugin for XCP-ng (meta: volume + datapath)
 
 License:        LGPL-2.1-only
@@ -99,6 +99,10 @@ echo "      Run 'xe-toolstack-restart' on each pool host to register SR type 'rb
 systemctl try-restart xapi-storage-script.service >/dev/null 2>&1 || :
 
 %changelog
+* Thu Aug 27 2026 dicode <info@dicode.nl> - 0.1-2
+- GC smart-defer (flatten only when it frees the parent snap; else defer).
+- rbd_features preset performance|compat; ms_mode default prefer-crc.
+
 * Thu Aug 27 2026 dicode <info@dicode.nl> - 0.1-1
 - Initial SMAPIv3 Ceph RBD plugin, split per XCP-ng convention into
   dicode-xapi-storage-volume-rbd (org.xen.xapi.storage.rbd-vol) and

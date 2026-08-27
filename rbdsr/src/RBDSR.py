@@ -56,8 +56,8 @@ CONFIGURATION = [
     ['user', 'cephx user for the datapath (default: admin)'],
     ['key', 'cephx base64 secret, aes256k (required)'],
     ['namespace', 'RBD namespace (default: SR uuid)'],
-    ['ms_mode', 'msgr mode: secure|prefer-secure|crc|prefer-crc|legacy (default: secure)'],
-    ['rbd_features', 'RBD image features, comma-separated (optional)'],
+    ['ms_mode', 'msgr mode: prefer-crc|crc|secure|prefer-secure|legacy (default: prefer-crc)'],
+    ['rbd_features', 'feature preset: performance (default) | compat (or an explicit comma-list)'],
     ['image_prefix', 'optional image-name prefix'],
     ['api_url', 'ceph-mgr dashboard URL, e.g. https://mgr:8443 (required)'],
     ['api_user', 'dashboard account'],
@@ -96,6 +96,27 @@ UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 TRASH_PREFIX = "xcp-trash-"
 GC_SPOOL = "/var/lib/rbdsr/gc"
 GC_STALE_AGE = 600   # s; a job file older than this => its worker likely died
+
+# rbd_features presets (device-config:rbd_features). 'layering' is always enforced
+# (clones require it). An explicit comma-list is still accepted as an advanced
+# override. 'performance' needs a krbd that can map object-map/fast-diff (5.3+;
+# our backport is 5.14). 'compat' maps on older/stock clients (krbd 4.9+) but has
+# slower snapshot/flatten/du and no deep-flatten (GC then defers, see rbd_gc.py).
+RBD_FEATURE_PRESETS = {
+    'performance': ['layering', 'exclusive-lock', 'object-map', 'fast-diff', 'deep-flatten'],
+    'compat': ['layering', 'exclusive-lock'],
+}
+
+
+def _resolve_rbd_features(value):
+    v = (value or 'performance').strip()
+    preset = RBD_FEATURE_PRESETS.get(v.lower())
+    if preset is not None:
+        return list(preset)
+    feats = [f.strip() for f in v.split(',') if f.strip()]
+    if 'layering' not in feats:
+        feats.insert(0, 'layering')
+    return feats
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +170,8 @@ class CephRBDSR(SR.SR):
         self.mon_host = self.dconf['mon_host']
         self.ceph_user = self.dconf.get('user', 'admin')
         self.key = self.dconf['key']
-        self.ms_mode = self.dconf.get('ms_mode', 'secure')
-        self.features = self.dconf.get(
-            'rbd_features', 'layering,exclusive-lock,object-map,fast-diff,deep-flatten')
+        self.ms_mode = self.dconf.get('ms_mode', 'prefer-crc')
+        self.features = self.dconf.get('rbd_features', 'performance')
         # XCP-ng's default guest VBD backend (vbd3/blktap3/tapback) only serves
         # blktap devices and IGNORES our raw RBD (major 252) -> the PV disk never
         # connects. We put backend-kind in each VDI's sm-config; XAPI propagates
@@ -188,7 +208,7 @@ class CephRBDSR(SR.SR):
         return name if name and UUID_RE.match(name) else None
 
     def _features_list(self):
-        return [f.strip() for f in self.features.split(',') if f.strip()]
+        return _resolve_rbd_features(self.features)
 
     # ---- SR ops ----
     def create(self, sr_uuid, size):
