@@ -29,26 +29,10 @@ def _features(meta):
     return lib.resolve_features(meta["dconf"].get("rbd_features"))
 
 
-def _flatten_children(be, pool, ns, base_image, snap_name=None):
-    """Detach any CoW clones hanging off base_image's snapshot(s) before the snap
-    can be removed. (Synchronous; the SMAPIv1 driver backgrounds this -- a later
-    optimisation to port here.)"""
-    try:
-        info = be.image_info(pool, base_image, namespace=ns)
-    except RbdBackendError:
-        return
-    for snap in info.get("snapshots", []) or []:
-        if snap_name is not None and snap.get("name") != snap_name:
-            continue
-        for child in snap.get("children", []) or []:
-            cimg = child.get("image_name")
-            if cimg:
-                be.flatten(child.get("pool_name", pool), cimg,
-                           namespace=child.get("namespace", ns))
-
-
 def _remove_snap(be, pool, ns, base_image, snap_name):
-    _flatten_children(be, pool, ns, base_image, snap_name)
+    # Only ever called for a snapshot with NO children -- destroy() hands a snap
+    # that still has CoW clones to the background GC (trash-rename + rbd_gc.py),
+    # which flattens the children first. So here we just unprotect + remove.
     try:
         be.snap_set_protected(pool, base_image, snap_name, False, namespace=ns)
     except RbdBackendError:

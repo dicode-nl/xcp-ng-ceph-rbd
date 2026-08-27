@@ -496,28 +496,10 @@ class CephRBDVDI(VDI.VDI):
         self.sr._updateStats(sr_uuid, self.size)
         return self.get_params()
 
-    def _flatten_children(self, base_image, snap_name=None):
-        """Lazy flatten: any clone depending on base_image@snap (a CoW child)
-        must be flattened before that snapshot can be removed. Children always
-        hang off a snapshot in RBD; flattening detaches them from the parent."""
-        try:
-            info = self.sr.backend.image_info(self.sr.pool, base_image, namespace=self.sr.namespace)
-        except RbdBackendError:
-            return
-        for snap in info.get('snapshots', []) or []:
-            if snap_name is not None and snap.get('name') != snap_name:
-                continue
-            for child in snap.get('children', []) or []:
-                cimage = child.get('image_name')
-                if not cimage:
-                    continue
-                util.SMlog("RBDVDI.delete: flattening child %s of %s@%s"
-                           % (cimage, base_image, snap.get('name')))
-                self.sr.backend.flatten(child.get('pool_name', self.sr.pool), cimage,
-                                        namespace=child.get('namespace', self.sr.namespace))
-
     def _remove_snap(self, base_image, snap_name):
-        self._flatten_children(base_image, snap_name)   # detach any clones first
+        # Only ever called for a snapshot with NO children -- delete() hands a
+        # snap that still has CoW clones to the background GC (trash-rename +
+        # rbd_gc.py), which flattens the children first. Here: unprotect + remove.
         try:
             self.sr.backend.snap_set_protected(self.sr.pool, base_image, snap_name, False,
                                                namespace=self.sr.namespace)
