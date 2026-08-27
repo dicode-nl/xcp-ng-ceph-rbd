@@ -271,6 +271,13 @@ class RestBackend(RbdBackend):
         return self._call("PUT", "/api/block/image/%s" % self._spec(pool, image, namespace),
                           "PUT /api/block/image/{spec}", body)
 
+    def image_meta_set(self, pool, image, metadata, size, namespace=""):
+        # rbd image-meta via the same PUT endpoint (metadata replaces the whole
+        # dict, so callers read-modify-write). size is included to be safe.
+        return self._call("PUT", "/api/block/image/%s" % self._spec(pool, image, namespace),
+                          "PUT /api/block/image/{spec}",
+                          {"size": int(size), "metadata": metadata, "configuration": {}})
+
     def snap_create(self, pool, image, snap, namespace=""):
         # mirrorImageSnapshot MUST be present or the dashboard 500s (validated).
         return self._call("POST", "/api/block/image/%s/snap" % self._spec(pool, image, namespace),

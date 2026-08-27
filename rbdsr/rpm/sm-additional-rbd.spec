@@ -6,7 +6,7 @@
 
 Name:           sm-additional-rbd
 Version:        2.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Ceph RBD Storage Repository driver for XCP-ng (native krbd + ceph-mgr dashboard API)
 
 License:        LGPL-2.1-only
@@ -86,6 +86,10 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Thu Aug 27 2026 dicode <info@dicode.nl> - 2.0-2
+- rbd_backend.list_images now filters by namespace (the dashboard returns every
+  image in the pool); prevents a 2nd SR on the same pool leaking VDIs into scan.
+
 * Wed Aug 26 2026 dicode <info@dicode.nl> - 2.0-1
 - Initial packaging of the RBD SR driver (async flatten-on-delete GC, native
   vdi_revert, dashboard REST control-plane, aes256k krbd datapath).
