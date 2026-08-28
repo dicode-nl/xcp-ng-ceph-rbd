@@ -59,6 +59,22 @@ def _rmw(be, pool, ns, base, mutate):
     be.image_meta_set(pool, base, m, int(info.get("size", 0)), namespace=ns)
 
 
+def _purge_snap_meta(be, pool, ns, base, snap):
+    """Drop a destroyed snapshot's leftover 'snap.<uuid>.*' keys (name/desc/
+    custom keys/cbt.*) from the base image meta. Best-effort: the snapshot's
+    rbd object is already gone, so a failure here only leaves cosmetic keys."""
+    prefix = lib.snap_meta_prefix(snap)
+
+    def _drop(m):
+        for k in [k for k in m if k.startswith(prefix)]:
+            m.pop(k, None)
+
+    try:
+        _rmw(be, pool, ns, base, _drop)
+    except RbdBackendError as e:
+        log.debug("_purge_snap_meta %s@%s: %s" % (base, snap, e))
+
+
 class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
 
     def create(self, dbg, sr, name, description, size, sharable):
@@ -103,6 +119,9 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                     gcjob.spawn(dconf, pool, ns, "snap", base, snap=trash)
                 else:
                     _remove_snap(be, pool, ns, base, snap)
+                # Tidy the snapshot's image-meta (keyed by its original uuid;
+                # the GC only sees the trash name, so clean it here).
+                _purge_snap_meta(be, pool, ns, base, snap)
             else:                          # a base image
                 try:
                     info = be.image_info(pool, base, namespace=ns)

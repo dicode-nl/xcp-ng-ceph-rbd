@@ -128,6 +128,17 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
             size = int(info.get("size", 0))
             used = int(info.get("disk_usage", 0) or 0)
             md = info.get("metadata")
+            # Self-heal: drop 'snap.<uuid>.*' meta left behind by snapshots that
+            # no longer exist (a failed destroy, an out-of-band snap removal).
+            snap_names = [s.get("name") for s in (info.get("snapshots") or [])]
+            orphans = lib.orphan_snap_meta_keys(md, snap_names)
+            if orphans:
+                try:
+                    kept = {k: v for k, v in (md or {}).items() if k not in orphans}
+                    be.image_meta_set(pool, name, kept, size, namespace=ns)
+                    md = kept
+                except RbdBackendError as e:
+                    log.debug("%s: SR.ls orphan-meta prune skipped: %s" % (dbg, e))
             cbt = lib.cbt_is_on(md)  # base + its snapshots share the CBT flag
             bname, bdesc, bkeys = lib.meta_view(md, None, name)
             out.append(lib.volume_dict(sr_uuid, name, name, bname, bdesc, size,

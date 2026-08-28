@@ -296,8 +296,20 @@ class RestBackend(RbdBackend):
                           "PUT /api/block/image/{spec}", body)
 
     def image_meta_set(self, pool, image, metadata, size, namespace=""):
-        # rbd image-meta via the same PUT endpoint (metadata replaces the whole
-        # dict, so callers read-modify-write). size is included to be safe.
+        # Whole-dict replace (callers read-modify-write). The dashboard image
+        # edit only UPSERTs the keys it's given and removes a key only when its
+        # value is null (RbdImageMetadataService.set_metadata: None -> remove).
+        # So to actually drop keys, send an explicit null for every current key
+        # that's absent from the desired dict. (image_info() metadata already
+        # excludes conf_* config keys, so those are never touched.)
+        metadata = dict(metadata or {})
+        try:
+            cur = self.image_info(pool, image, namespace=namespace).get("metadata") or {}
+        except RbdBackendError:
+            cur = {}
+        for k in cur:
+            if k not in metadata:
+                metadata[k] = None
         return self._call("PUT", "/api/block/image/%s" % self._spec(pool, image, namespace),
                           "PUT /api/block/image/{spec}",
                           {"size": int(size), "metadata": metadata, "configuration": {}})

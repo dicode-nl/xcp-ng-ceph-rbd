@@ -82,6 +82,30 @@ def meta_names(snap):
     return b + ".name", b + ".desc", b + ".k."
 
 
+def snap_meta_prefix(snap):
+    """Common prefix of every base-image meta key owned by snapshot <snap>
+    (name/desc/custom keys/cbt.*). Used to purge them when the snapshot is
+    destroyed so orphan keys don't accumulate on the base image."""
+    return "snap.%s." % snap
+
+
+_SNAP_META_RE = re.compile(r"^snap\.([0-9a-f-]{36})\.", re.I)
+
+
+def orphan_snap_meta_keys(metadata, live_snap_names):
+    """Base-image meta keys of the form 'snap.<uuid>.*' whose <uuid> is not a
+    currently-existing snapshot -- i.e. cruft a failed/partial destroy (or an
+    out-of-band snap removal) left behind. SR.ls prunes these opportunistically
+    so the base image's metadata self-heals instead of growing without bound."""
+    live = set(live_snap_names or [])
+    out = []
+    for k in (metadata or {}):
+        m = _SNAP_META_RE.match(k)
+        if m and UUID_RE.match(m.group(1)) and m.group(1) not in live:
+            out.append(k)
+    return out
+
+
 def meta_view(metadata, snap, uuid):
     """Extract (name, description, keys) for a logical volume from a base image's
     metadata dict."""
