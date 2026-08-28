@@ -87,7 +87,12 @@ def meta_view(metadata, snap, uuid):
     metadata dict."""
     nk, dk, kp = meta_names(snap)
     m = metadata or {}
-    name = m.get(nk) or uuid
+    # A snapshot with no explicit name of its own inherits the base image's
+    # name (as xapi does on VDI.snapshot). Without this fallback a re-scan would
+    # rename the snapshot VDI to its bare uuid.
+    base_nk = meta_names(None)[0]  # "vdi.name"
+    fallback = m.get(base_nk) if snap is not None else None
+    name = m.get(nk) or fallback or uuid
     desc = m.get(dk, "")
     keys = {k[len(kp):]: v for k, v in m.items() if k.startswith(kp)}
     return name, desc, keys
@@ -125,8 +130,14 @@ def changed_bitmap(diffs, offset, length, block=CBT_BLOCK):
 
 
 def volume_dict(sr_uuid, key, uuid, name, description, size,
-                physical_utilisation=0, read_write=True, sharable=False, keys=None):
-    """The SMAPIv3 volume record returned by create/stat/ls/snapshot/clone."""
+                physical_utilisation=0, read_write=True, sharable=False, keys=None,
+                cbt_enabled=False):
+    """The SMAPIv3 volume record returned by create/stat/ls/snapshot/clone.
+
+    cbt_enabled is read by the xapi-storage-script bridge into the VDI's
+    cbt_enabled field; xapi's VDI.data_destroy pre-check (and XO's CBT backup)
+    require a snapshot to report it, so a snapshot of a CBT-enabled base must
+    carry it through."""
     return {
         "key": key,
         "uuid": uuid,
@@ -138,4 +149,12 @@ def volume_dict(sr_uuid, key, uuid, name, description, size,
         "uri": [volume_uri(sr_uuid, key)],
         "sharable": bool(sharable),
         "keys": keys or {},
+        "cbt_enabled": bool(cbt_enabled),
     }
+
+
+def cbt_is_on(metadata):
+    """Whether CBT is enabled on the base image (enable_cbt marks 'cbt.enabled').
+    Snapshots inherit the base's flag -- once CBT is on, snapshots are CBT
+    reference points."""
+    return bool((metadata or {}).get("cbt.enabled"))

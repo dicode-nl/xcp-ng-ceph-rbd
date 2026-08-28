@@ -128,10 +128,11 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
             size = int(info.get("size", 0))
             used = int(info.get("disk_usage", 0) or 0)
             md = info.get("metadata")
+            cbt = lib.cbt_is_on(md)  # base + its snapshots share the CBT flag
             bname, bdesc, bkeys = lib.meta_view(md, None, name)
             out.append(lib.volume_dict(sr_uuid, name, name, bname, bdesc, size,
                                        physical_utilisation=used, read_write=True,
-                                       keys=bkeys))
+                                       keys=bkeys, cbt_enabled=cbt))
             for snap in info.get("snapshots", []) or []:
                 sname = snap.get("name", "")
                 if sname.startswith(gcjob.TRASH_PREFIX):   # trashed snap mid-GC
@@ -145,7 +146,7 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
                 ssize = int(snap.get("size", size) or size)
                 sn, sd, sk = lib.meta_view(md, sname, sname)
                 out.append(lib.volume_dict(sr_uuid, key, sname, sn, sd, ssize,
-                                           read_write=False, keys=sk))
+                                           read_write=False, keys=sk, cbt_enabled=cbt))
         return out
 
     def set_name(self, dbg, sr, new_name):

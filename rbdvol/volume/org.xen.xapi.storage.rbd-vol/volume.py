@@ -150,9 +150,33 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
             except RbdBackendError:
                 pass
             raise Exception("VDI snapshot failed: %s" % e)
-        size = self._size_of(be, pool, ns, base)
+        try:
+            binfo = be.image_info(pool, base, namespace=ns)
+        except RbdBackendError:
+            binfo = {}
+        size = int(binfo.get("size", 0) or 0)
+        bmd = binfo.get("metadata") or {}
+        cbt = lib.cbt_is_on(bmd)  # inherit base's CBT flag
+        # Persist the snapshot's name+description (inherited from the base at
+        # snapshot time, as xapi does) so a later re-scan keeps them instead of
+        # renaming the VDI to its bare uuid. A later Volume.set_name overrides it.
+        bnk, bdk, _ = lib.meta_names(None)          # vdi.name / vdi.desc
+        snk, sdk, _ = lib.meta_names(snap_uuid)     # snap.<uuid>.name / .desc
+        base_name = bmd.get(bnk)
+        base_desc = bmd.get(bdk)
+        if base_name or base_desc:
+            def _seed(m):
+                if base_name:
+                    m[snk] = base_name
+                if base_desc:
+                    m[sdk] = base_desc
+            try:
+                _rmw(be, pool, ns, base, _seed)
+            except RbdBackendError:
+                pass
         return lib.volume_dict(meta["sr_uuid"], lib.snap_key(base, snap_uuid),
-                               snap_uuid, snap_uuid, "", size, read_write=False)
+                               snap_uuid, base_name or snap_uuid, base_desc or "",
+                               size, read_write=False, cbt_enabled=cbt)
 
     def clone(self, dbg, sr, key):
         meta = srmeta.read(sr)
@@ -218,18 +242,19 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
         except RbdBackendError as e:
             raise Exception("VDI stat failed: %s" % e)
         md = info.get("metadata")
+        cbt = lib.cbt_is_on(md)  # snapshots inherit the base image's CBT flag
         if snap:
             s = next((x for x in info.get("snapshots", []) or []
                       if x.get("name") == snap), None)
             size = int((s or {}).get("size", info.get("size", 0)) or 0)
             name, desc, keys = lib.meta_view(md, snap, snap)
             return lib.volume_dict(meta["sr_uuid"], key, snap, name, desc, size,
-                                   read_write=False, keys=keys)
+                                   read_write=False, keys=keys, cbt_enabled=cbt)
         name, desc, keys = lib.meta_view(md, None, base)
         return lib.volume_dict(meta["sr_uuid"], base, base, name, desc,
                                int(info.get("size", 0)),
                                physical_utilisation=int(info.get("disk_usage", 0) or 0),
-                               read_write=True, keys=keys)
+                               read_write=True, keys=keys, cbt_enabled=cbt)
 
     # --- custom keys / labels, backed by rbd image-meta (see rbdvol_lib) ---
     def _open(self, sr, key):
