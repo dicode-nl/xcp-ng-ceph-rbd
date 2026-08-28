@@ -263,6 +263,70 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
         _rmw(be, pool, ns, base, lambda m: m.__setitem__(dk, new_description))
         log.debug("%s: Volume.set_description %s" % (dbg, key))
 
+    # --- Changed Block Tracking (native, via rbd diff) ---
+    @staticmethod
+    def _cbt_key(snap):
+        return "cbt.enabled" if snap is None else "snap.%s.cbt.enabled" % snap
+
+    def enable_cbt(self, dbg, sr, key):
+        be, pool, ns, base, snap = self._open(sr, key)
+        feats = (be.image_info(pool, base, namespace=ns).get("features_name")
+                 or [])
+        if "fast-diff" not in feats:
+            # rbd-diff CBT needs object-map/fast-diff (rbd_features=performance).
+            # A 'compat' image can still get CBT via the tapdisk datapath (later).
+            raise Exception("CBT requires fast-diff/object-map on the image "
+                            "(rbd_features 'performance'); this image is 'compat'")
+        mk = self._cbt_key(snap)
+        _rmw(be, pool, ns, base, lambda m: m.__setitem__(mk, "1"))
+        log.debug("%s: Volume.enable_cbt %s" % (dbg, key))
+
+    def disable_cbt(self, dbg, sr, key):
+        be, pool, ns, base, snap = self._open(sr, key)
+        mk = self._cbt_key(snap)
+        _rmw(be, pool, ns, base, lambda m: m.pop(mk, None))
+        log.debug("%s: Volume.disable_cbt %s" % (dbg, key))
+
+    def data_destroy(self, dbg, sr, key):
+        # "delete the snapshot's data but keep its CBT metadata". For RBD the
+        # snapshot IS the anchor the NEXT diff is taken from, so we KEEP the rbd
+        # snapshot and only record that xapi considers the data gone.
+        be, pool, ns, base, snap = self._open(sr, key)
+        if snap is None:
+            raise Exception("data_destroy target is not a snapshot: %s" % key)
+        mk = "snap.%s.cbt.data_destroyed" % snap
+        _rmw(be, pool, ns, base, lambda m: m.__setitem__(mk, "1"))
+        log.debug("%s: Volume.data_destroy %s (rbd snap kept as CBT anchor)"
+                  % (dbg, key))
+
+    def list_changed_blocks(self, dbg, sr, key, key2, offset, length):
+        meta = srmeta.read(sr)
+        be = lib.backend(meta)
+        pool, ns = lib.pool_ns(meta)
+        base, from_snap = lib.split_key(key)     # xapi: vdi_from (earlier)
+        base2, to_snap = lib.split_key(key2)     # xapi: vdi_to   (later)
+        if base != base2:
+            raise Exception("list_changed_blocks across different images: %s vs %s"
+                            % (base, base2))
+        size = int(be.image_info(pool, base, namespace=ns).get("size", 0) or 0)
+        off = int(offset or 0)
+        ln = int(length) if length else (size - off)
+        ln = max(0, min(ln, size - off))
+        whole = str(meta["dconf"].get("cbt_whole_object", "true")).lower() \
+            in ("1", "true", "yes")
+        try:
+            diffs = be.image_diff(pool, base, from_snap, to_snap, offset=off,
+                                  length=ln, whole_object=whole, namespace=ns)
+        except RbdBackendError as e:
+            if e.not_supported:
+                raise xapi.storage.api.v5.volume.Unimplemented(
+                    "Volume.list_changed_blocks: %s" % e)
+            raise Exception("list_changed_blocks failed: %s" % e)
+        log.debug("%s: Volume.list_changed_blocks %s..%s off=%s len=%s -> %d extents"
+                  % (dbg, key, key2, off, ln, len(diffs)))
+        return {"granularity": lib.CBT_BLOCK,
+                "bitmap": lib.changed_bitmap(diffs, off, ln)}
+
     # --- helper ---
     @staticmethod
     def _size_of(be, pool, ns, image):
@@ -282,6 +346,9 @@ if __name__ == "__main__":
         "Volume.revert": cmd.revert, "Volume.resize": cmd.resize,
         "Volume.stat": cmd.stat, "Volume.set": cmd.set, "Volume.unset": cmd.unset,
         "Volume.set_name": cmd.set_name, "Volume.set_description": cmd.set_description,
+        "Volume.enable_cbt": cmd.enable_cbt, "Volume.disable_cbt": cmd.disable_cbt,
+        "Volume.data_destroy": cmd.data_destroy,
+        "Volume.list_changed_blocks": cmd.list_changed_blocks,
     }
     if base in dispatch:
         dispatch[base]()

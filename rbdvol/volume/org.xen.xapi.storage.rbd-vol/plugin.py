@@ -35,19 +35,18 @@ class Implementation(xapi.storage.api.v5.plugin.Plugin_skeleton):
             "required_api_version": "5.0",
             # Keep this list in LOCKSTEP with the Volume.* executables we actually
             # ship (advertising a feature whose method is missing => runtime errors).
-            # Target set for rbd-vol, all native RBD:
-            #   phase 2/3: CREATE, DESTROY, SNAPSHOT, CLONE, RESIZE, REVERT (rbd snap
-            #              rollback - zfs-vol omits this; we have it natively)
-            #   later:     CBT via enable_cbt/disable_cbt/list_changed_blocks (rbd
-            #              fast-diff) and copy/mirror via the separate Data plugin
-            #              (snapshot-diff or opt-in tapdisk datapath) for backup/SXM.
-            # compose is N/A for raw RBD.
+            #   VDI_CONFIG_CBT -> enable_cbt/disable_cbt/data_destroy/
+            #     list_changed_blocks, native via rbd diff (needs the rbd_features
+            #     'performance' preset + the ceph-mgr /diff endpoint, or backend=local).
+            # Still to come: copy/mirror via the separate Data plugin (snapshot-diff
+            # or opt-in tapdisk datapath) for backup/SXM. compose is N/A for raw RBD.
             "features": [
                 "VDI_CREATE",
                 "VDI_DESTROY",
                 "VDI_RESIZE",
                 "VDI_SNAPSHOT",
                 "VDI_CLONE",
+                "VDI_CONFIG_CBT",
             ],
             "configuration": {},
             "required_cluster_stack": []}

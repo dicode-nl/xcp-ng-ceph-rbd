@@ -93,6 +93,37 @@ def meta_view(metadata, snap, uuid):
     return name, desc, keys
 
 
+# ---- CBT: changed-block bitmap ----
+CBT_BLOCK = 65536  # 64 KiB, the XAPI / NBD changed-block-tracking granularity
+
+
+def changed_bitmap(diffs, offset, length, block=CBT_BLOCK):
+    """Turn rbd changed extents ([{offset,length,exists}, ...]) into the base64
+    bitmap that Volume.list_changed_blocks returns: one bit per <block> bytes
+    over [offset, offset+length), set when that block changed.
+
+    Bit order is MSB-first within each byte (block b -> byte b//8, bit
+    0x80>>(b%8)) -- the XenServer/XAPI CBT convention. NB: validate end-to-end
+    against a real XO delta backup; if the delta looks byte-reversed, this single
+    shift is the only thing to flip.
+    """
+    import base64
+    length = int(length or 0)
+    nblocks = (length + block - 1) // block
+    bits = bytearray((nblocks + 7) // 8)
+    end = offset + length
+    for d in diffs or []:
+        if not d.get("exists"):
+            continue
+        s = max(int(d["offset"]), offset)
+        e = min(int(d["offset"]) + int(d["length"]), end)
+        if e <= s:
+            continue
+        for b in range((s - offset) // block, (e - 1 - offset) // block + 1):
+            bits[b // 8] |= 0x80 >> (b % 8)
+    return base64.b64encode(bytes(bits)).decode("ascii")
+
+
 def volume_dict(sr_uuid, key, uuid, name, description, size,
                 physical_utilisation=0, read_write=True, sharable=False, keys=None):
     """The SMAPIv3 volume record returned by create/stat/ls/snapshot/clone."""

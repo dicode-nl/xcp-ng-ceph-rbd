@@ -79,6 +79,12 @@ class RbdBackend(object):
         raise NotImplementedError
     def snap_rename(self, pool, image, snap, new_snap, namespace=""):
         raise NotImplementedError
+    def image_diff(self, pool, image, from_snap, to_snap, offset=0, length=None,
+                   whole_object=True, namespace=""):
+        """Changed extents between two states of an image (for CBT).
+        from_snap=None -> from image creation; to_snap=None -> the live head.
+        -> [{'offset','length','exists'}]. May raise not_supported."""
+        raise NotImplementedError
     def pool_stats(self, pool):
         """-> {'total':bytes,'used':bytes,'free':bytes}."""
         raise NotImplementedError
@@ -131,6 +137,7 @@ class RestBackend(RbdBackend):
         "POST /api/block/image/{spec}/snap/{name}/rollback": "1.0",
         "POST /api/block/image/{spec}/snap/{name}/clone": "1.0",
         "POST /api/block/image/{spec}/flatten": "1.0",
+        "GET /api/block/image/{spec}/diff": "1.0",
         "GET /api/pool": "1.0",
         "GET /api/block/pool/{pool}/namespace": "1.0",
         "POST /api/block/pool/{pool}/namespace": "1.0",
@@ -345,6 +352,33 @@ class RestBackend(RbdBackend):
         return self._call("PUT", "/api/block/image/%s/snap/%s"
                           % (self._spec(pool, image, namespace), urllib.parse.quote(snap, safe="")),
                           "PUT /api/block/image/{spec}/snap/{name}", {"new_snap_name": new_snap})
+
+    def image_diff(self, pool, image, from_snap, to_snap, offset=0, length=None,
+                   whole_object=True, namespace=""):
+        q = ["offset=%d" % int(offset),
+             "whole_object=%s" % ("true" if whole_object else "false")]
+        if from_snap:
+            q.append("from_snapshot=" + urllib.parse.quote(from_snap, safe=""))
+        if to_snap:
+            q.append("snapshot_name=" + urllib.parse.quote(to_snap, safe=""))
+        if length is not None:
+            q.append("length=%d" % int(length))
+        path = "/api/block/image/%s/diff?%s" % (self._spec(pool, image, namespace),
+                                                "&".join(q))
+        try:
+            bd = self._call("GET", path, "GET /api/block/image/{spec}/diff")
+        except RbdBackendError as e:
+            # A route-level 404 ("The path ... was not found") means this mgr
+            # lacks the rbd-diff patch -> surface as not_supported so CBT can
+            # degrade gracefully (vs a real image/snap not_found, which we keep).
+            if e.status == 404 and "the path" in str(e).lower():
+                raise RbdBackendError("dashboard has no /diff endpoint "
+                                      "(needs the ceph rbd-diff patch)",
+                                      status=404, not_supported=True)
+            raise
+        if isinstance(bd, dict):
+            return bd.get("diffs", []) or []
+        return bd or []
 
     def pool_stats(self, pool):
         bd = self._call("GET", "/api/pool?stats=true", "GET /api/pool")
@@ -624,6 +658,27 @@ class LocalBackend(RbdBackend):
         with self._ioctx(pool, namespace) as ioctx:
             with self._rbd.Image(ioctx, image) as img:
                 img.rename_snap(snap, new_snap)
+
+    @_map_rbd_errors
+    def image_diff(self, pool, image, from_snap, to_snap, offset=0, length=None,
+                   whole_object=True, namespace=""):
+        diffs = []
+        with self._ioctx(pool, namespace) as ioctx:
+            # open read-only at the target state (a snapshot, or the live head)
+            with self._rbd.Image(ioctx, image, snapshot=to_snap,
+                                 read_only=True) as img:
+                size = int(img.size())
+                start = int(offset)
+                dl = size - start if length is None else int(length)
+                dl = max(0, min(dl, size - start))
+
+                def _cb(_off, _len, exists):
+                    diffs.append({"offset": _off, "length": _len,
+                                  "exists": bool(exists)})
+                if dl > 0:
+                    img.diff_iterate(start, dl, from_snap, _cb,
+                                     whole_object=whole_object)
+        return diffs
 
     @_map_rbd_errors
     def pool_stats(self, pool):
