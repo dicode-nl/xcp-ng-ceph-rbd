@@ -310,7 +310,9 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                             % (base, base2))
         size = int(be.image_info(pool, base, namespace=ns).get("size", 0) or 0)
         off = int(offset or 0)
-        ln = int(length) if length else (size - off)
+        # xapi passes length=-1 to mean "to the end of the image".
+        length = -1 if length is None else int(length)
+        ln = (size - off) if length < 0 else length
         ln = max(0, min(ln, size - off))
         whole = str(meta["dconf"].get("cbt_whole_object", "true")).lower() \
             in ("1", "true", "yes")
