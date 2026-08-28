@@ -1,7 +1,8 @@
 # xcp-ng-ceph-rbd
 
-A native **Ceph RBD storage stack for XCP-ng 8.3** — no `rbd`/`ceph` userspace on
-dom0. Three components:
+A native **Ceph RBD storage stack for XCP-ng 8.3** — the data path is the
+in-kernel Ceph client, so no `rbd`/`ceph` userspace is required on dom0. Three
+components:
 
 1. **`kernel-modules/`** — the backported in-kernel Ceph client (`libceph.ko` +
    `rbd.ko`) plus an in-kernel Kerberos5 crypto module (`krb5.ko`), giving the
@@ -16,8 +17,11 @@ dom0. Three components:
 
 3. **`rbdvol/`** — a **SMAPIv3** plugin (SR type `rbd-vol`) with the same data
    model and datapath, reworked onto the xapi-storage volume/datapath split
-   (python3). Adds an optional tapdisk datapath mode. Ships as
-   `dicode-xapi-storage-volume-rbd` + `dicode-xapi-storage-datapath-rbd`.
+   (python3). Adds an optional tapdisk datapath mode, and a **pluggable control
+   plane**: the ceph-mgr **dashboard REST API** (default, needs no userspace) or
+   an optional **local `librbd` backend** for hosts that do have a ceph
+   userspace. Ships as `dicode-xapi-storage-volume-rbd` +
+   `dicode-xapi-storage-datapath-rbd`.
 
 Runtime-validated end-to-end on XCP-ng 8.3 against a Ceph 20.2.4 cluster: full
 VDI lifecycle, native `VDI.revert`, CoW clone with async flatten-on-delete, a

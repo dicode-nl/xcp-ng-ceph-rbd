@@ -1,19 +1,29 @@
 """
 rbd_backend.py - control-plane backends for the Ceph RBD SR.
 
-The SR driver never shells out to `ceph`/`rbd` (el7 dom0 has no aes256k-capable
-userspace). All volume-management ops go through an RbdBackend. The default and
-only implemented backend talks to the ceph-mgr *dashboard* REST API over HTTPS
-(JWT auth), which needs nothing on dom0 but python stdlib. The cephx key is used
-ONLY for the datapath (kernel rbd map, see rbd_sysfs.py), never here.
+All volume-management ops go through an RbdBackend. Two are implemented,
+selected by device-config `backend=`:
 
-Contract validated against Ceph 20.2.4 (Tentacle); see the endpoint/version
-table in RestBackend.VERSIONS.
+  * backend=rest (default) -- talks to the ceph-mgr *dashboard* REST API over
+    HTTPS (JWT auth). Needs nothing on the host but python stdlib, so it works
+    on an el7 dom0 that has no aes256k-capable ceph userspace. The cephx key is
+    used ONLY for the datapath (kernel rbd map, see rbd_sysfs.py), never here.
+  * backend=local -- uses the librbd/librados python bindings (python3-rbd,
+    python3-rados). For hosts that DO have a working ceph userspace; no
+    dashboard required. Cluster access reuses the same mon_host/user/key as the
+    datapath, or an explicit ceph_conf. The bindings are imported LAZILY (only
+    when backend=local is selected), so the default REST path stays import-clean
+    on a dom0 that has no ceph userspace.
 
-Stdlib only (urllib), python 3.6+ (matches XCP-ng 8.3 dom0 sm).
+Both return identical dict shapes so the rest of the driver is backend-agnostic.
+REST contract validated against Ceph 20.2.4 (Tentacle); see RestBackend.VERSIONS.
+
+REST path is stdlib-only (urllib); the local backend imports rbd/rados lazily.
+python 3.6+ (matches XCP-ng 8.3 dom0 sm).
 """
 
 import json
+import math
 import ssl
 import time
 import urllib.parse
@@ -82,7 +92,7 @@ class RbdBackend(object):
 
 
 def make_backend(dconf):
-    """Factory from SR device-config. backend=rest (default)."""
+    """Factory from SR device-config. backend=rest (default) | local."""
     kind = dconf.get("backend", "rest").lower()
     if kind == "rest":
         url = dconf.get("api_url")
@@ -94,7 +104,14 @@ def make_backend(dconf):
             secret=dconf.get("api_secret", ""),
             tls_verify=dconf.get("api_tls_verify", "false").lower() in ("1", "true", "yes"),
         )
-    raise RbdBackendError("unknown backend %r (only 'rest' implemented)" % kind)
+    if kind in ("local", "cli", "librbd", "rbd"):
+        return LocalBackend(
+            mon_host=dconf.get("mon_host"),
+            user=dconf.get("user") or dconf.get("api_user"),
+            key=dconf.get("key"),
+            ceph_conf=dconf.get("ceph_conf"),
+        )
+    raise RbdBackendError("unknown backend %r (use 'rest' or 'local')" % kind)
 
 
 class RestBackend(RbdBackend):
@@ -370,3 +387,274 @@ class RestBackend(RbdBackend):
         return self._call("DELETE", "/api/block/pool/%s/namespace/%s"
                           % (urllib.parse.quote(pool), urllib.parse.quote(namespace)),
                           "DELETE /api/block/pool/{pool}/namespace/{ns}")
+
+
+def _map_rbd_errors(method):
+    """Translate librbd/librados exceptions into RbdBackendError (keeps
+    not_found semantics so the toolstack behaves as with the REST backend)."""
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except RbdBackendError:
+            raise
+        except self._rbd.ImageNotFound as e:
+            raise RbdBackendError(str(e), not_found=True)
+        except self._rbd.ObjectExists as e:
+            raise RbdBackendError(str(e), status=17)
+        except Exception as e:  # rados.Error / rbd.Error / OSError / ...
+            raise RbdBackendError("%s: %s" % (type(e).__name__, e))
+    wrapper.__name__ = getattr(method, "__name__", "wrapped")
+    return wrapper
+
+
+class LocalBackend(RbdBackend):
+    """Control-plane backend using the librbd/librados python bindings.
+
+    For hosts that DO have a working (aes256k-capable) ceph userspace: an
+    alternative to RestBackend that needs no ceph-mgr dashboard. python3-rbd /
+    python3-rados are imported LAZILY (only when backend=local is selected) so
+    the default REST path stays binding-free on a dom0 without ceph userspace.
+
+    One rados connection per plugin invocation; cluster access reuses the
+    datapath's mon_host/user/key (passed inline -- no keyring file) or an
+    explicit ceph_conf. Every method returns the SAME dict shapes as
+    RestBackend, so volume.py / sr.py / rbd_gc.py stay backend-agnostic.
+    """
+    CONNECT_TIMEOUT = 30
+
+    def __init__(self, mon_host=None, user=None, key=None, ceph_conf=None):
+        try:
+            import rados
+            import rbd
+        except ImportError as e:
+            raise RbdBackendError(
+                "backend=local needs the ceph python bindings "
+                "(python3-rbd/python3-rados): %s" % e)
+        self._rados = rados
+        self._rbd = rbd
+        self._inst = rbd.RBD()
+        # feature name<->bit map (guard: not every constant exists on old libs)
+        self._feat_bit = {}
+        for n in ("LAYERING", "STRIPINGV2", "EXCLUSIVE_LOCK", "OBJECT_MAP",
+                  "FAST_DIFF", "DEEP_FLATTEN", "JOURNALING", "DATA_POOL",
+                  "OPERATIONS"):
+            bit = getattr(rbd, "RBD_FEATURE_" + n, None)
+            if bit is not None:
+                self._feat_bit[n.lower().replace("_", "-")] = bit
+        conf = {}
+        if mon_host:
+            conf["mon_host"] = mon_host
+        if key:
+            conf["key"] = key
+        try:
+            if ceph_conf:
+                self._cluster = rados.Rados(conffile=ceph_conf, conf=conf,
+                                            rados_id=user or "admin")
+            elif conf:
+                self._cluster = rados.Rados(conf=conf, rados_id=user or "admin")
+            else:
+                self._cluster = rados.Rados(rados_id=user or "admin")
+            self._cluster.connect(timeout=self.CONNECT_TIMEOUT)
+        except Exception as e:
+            raise RbdBackendError("cannot connect to ceph (backend=local): %s" % e)
+        _log("connected via librbd (backend=local)")
+
+    # ---- helpers ----
+    def _feats_to_names(self, bitmask):
+        return sorted(n for n, bit in self._feat_bit.items()
+                      if bitmask & bit == bit)
+
+    def _feats_to_mask(self, features):
+        f = RestBackend._feats(features)
+        if f is None:
+            return None
+        mask = 0
+        for name in f:
+            mask |= self._feat_bit.get(name, 0)
+        return mask
+
+    def _ioctx(self, pool, namespace=""):
+        ioctx = self._cluster.open_ioctx(pool)
+        ioctx.set_namespace(namespace or "")
+        return ioctx
+
+    # ---- RbdBackend API ----
+    @_map_rbd_errors
+    def list_images(self, pool, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            # the ioctx namespace scopes the listing -> no cross-namespace leak
+            return [{"name": n, "namespace": namespace or ""}
+                    for n in self._inst.list(ioctx)]
+
+    @_map_rbd_errors
+    def image_info(self, pool, image, namespace=""):
+        out = {"name": image, "namespace": namespace or "", "size": 0,
+               "features_name": [], "parent": None, "metadata": {},
+               "snapshots": [], "disk_usage": 0}
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                size = int(img.size())
+                out["size"] = size
+                feats = self._feats_to_names(img.features())
+                out["features_name"] = feats
+                try:
+                    pp, pi, ps = img.parent_info()
+                    out["parent"] = {"pool": pp, "image": pi, "snapshot": ps}
+                except self._rbd.ImageNotFound:
+                    out["parent"] = None
+                out["metadata"] = {k: v for k, v in img.metadata_list()}
+                for s in img.list_snaps():
+                    name = s["name"]
+                    try:
+                        img.set_snap(name)
+                        children = list(img.list_children())
+                    except Exception:
+                        children = []
+                    finally:
+                        img.set_snap(None)
+                    out["snapshots"].append({
+                        "name": name, "size": int(s.get("size", 0) or 0),
+                        "children": children})
+                # Physical usage via a whole-object diff is cheap only when
+                # fast-diff/object-map is present: it then just reads the small
+                # object-map bitmap. Our backported krbd DOES maintain that map
+                # (verified: krbd-written images keep valid flags), so on the
+                # default 'performance' preset this is fast. The 'compat' preset
+                # has no map -> a whole-object diff would scan every object, so
+                # skip it there and leave disk_usage at 0.
+                if size and "fast-diff" in feats:
+                    used = [0]
+
+                    def _cb(_off, _len, exists):
+                        if exists:
+                            used[0] += _len
+                    try:
+                        img.diff_iterate(0, size, None, _cb, whole_object=True)
+                        out["disk_usage"] = used[0]
+                    except Exception:
+                        out["disk_usage"] = 0
+        return out
+
+    @_map_rbd_errors
+    def create(self, pool, image, size, features, namespace="", obj_size=None):
+        mask = self._feats_to_mask(features)
+        order = 0
+        if obj_size:
+            order = int(round(math.log(float(obj_size), 2)))
+        with self._ioctx(pool, namespace) as ioctx:
+            self._inst.create(ioctx, image, int(size), order=order,
+                              old_format=False, features=mask)
+
+    @_map_rbd_errors
+    def remove(self, pool, image, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            self._inst.remove(ioctx, image)
+
+    @_map_rbd_errors
+    def resize(self, pool, image, size, features=None, namespace=""):
+        # librbd resize allows shrink by default -> matches the REST backend.
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                img.resize(int(size))
+
+    @_map_rbd_errors
+    def image_meta_set(self, pool, image, metadata, size, namespace=""):
+        # REST replaces the whole image-meta dict; emulate that.
+        metadata = metadata or {}
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                cur = {k: v for k, v in img.metadata_list()}
+                for k in cur:
+                    if k not in metadata:
+                        img.metadata_remove(k)
+                for k, v in metadata.items():
+                    img.metadata_set(k, "" if v is None else str(v))
+
+    @_map_rbd_errors
+    def snap_create(self, pool, image, snap, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                img.create_snap(snap)
+
+    @_map_rbd_errors
+    def snap_remove(self, pool, image, snap, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                img.remove_snap(snap)
+
+    @_map_rbd_errors
+    def snap_set_protected(self, pool, image, snap, protected, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                if protected:
+                    img.protect_snap(snap)
+                else:
+                    img.unprotect_snap(snap)
+
+    @_map_rbd_errors
+    def snap_rollback(self, pool, image, snap, namespace=""):
+        # Blocks until the rollback completes (can be long for a big image).
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                img.rollback_to_snap(snap)
+
+    @_map_rbd_errors
+    def clone(self, pool, image, snap, dst_pool, dst_image, features=None,
+              namespace="", dst_namespace=""):
+        mask = self._feats_to_mask(features)
+        with self._ioctx(pool, namespace) as p_ioctx:
+            with self._ioctx(dst_pool, dst_namespace) as c_ioctx:
+                self._inst.clone(p_ioctx, image, snap, c_ioctx, dst_image,
+                                 features=mask)
+
+    @_map_rbd_errors
+    def flatten(self, pool, image, namespace=""):
+        # Blocks until flatten finishes; no HTTP timeout to worry about here.
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                img.flatten()
+
+    @_map_rbd_errors
+    def image_rename(self, pool, image, new_name, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            self._inst.rename(ioctx, image, new_name)
+
+    @_map_rbd_errors
+    def snap_rename(self, pool, image, snap, new_snap, namespace=""):
+        with self._ioctx(pool, namespace) as ioctx:
+            with self._rbd.Image(ioctx, image) as img:
+                img.rename_snap(snap, new_snap)
+
+    @_map_rbd_errors
+    def pool_stats(self, pool):
+        ret, buf, errs = self._cluster.mon_command(
+            json.dumps({"prefix": "df", "format": "json"}), b"")
+        if ret != 0:
+            raise RbdBackendError("`ceph df` failed: %s" % errs)
+        df = json.loads(buf.decode() if isinstance(buf, bytes) else buf)
+        for p in df.get("pools", []) or []:
+            if p.get("name") == pool:
+                st = p.get("stats", {}) or {}
+                used = int(st.get("bytes_used", st.get("stored", 0)) or 0)
+                free = int(st.get("max_avail", 0) or 0)
+                return {"used": used, "free": free, "total": used + free}
+        raise RbdBackendError("pool %r not found in `ceph df`" % pool,
+                              not_found=True)
+
+    @_map_rbd_errors
+    def namespace_list(self, pool):
+        with self._cluster.open_ioctx(pool) as ioctx:
+            return list(self._inst.namespace_list(ioctx))
+
+    @_map_rbd_errors
+    def namespace_create(self, pool, namespace):
+        try:
+            with self._cluster.open_ioctx(pool) as ioctx:
+                self._inst.namespace_create(ioctx, namespace)
+        except self._rbd.ObjectExists:
+            return None  # idempotent
+
+    @_map_rbd_errors
+    def namespace_remove(self, pool, namespace):
+        with self._cluster.open_ioctx(pool) as ioctx:
+            self._inst.namespace_remove(ioctx, namespace)

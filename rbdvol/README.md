@@ -17,7 +17,11 @@ SMAPIv3 splits storage into a **volume plugin** (manages the SR + volumes) and a
 plugins/processes and are packaged as separate RPMs.
 
 ### `volume/org.xen.xapi.storage.rbd-vol/` — the volume plugin
-Control-plane over the ceph-mgr **dashboard REST API** (no ceph userspace on dom0).
+**Pluggable control plane** (`device-config:backend=`): the ceph-mgr **dashboard
+REST API** (`rest`, the default — needs no ceph userspace on dom0) or a **local
+`librbd` backend** (`local` — uses the `python3-rbd` / `python3-rados` bindings,
+for hosts that *do* have a working ceph userspace; no dashboard required). The
+data path (krbd map) is unchanged either way.
 
 | file | role |
 |------|------|
@@ -27,7 +31,7 @@ Control-plane over the ceph-mgr **dashboard REST API** (no ceph userspace on dom
 | `srmeta.py`      | per-host SR metadata store (`/var/run/rbd-vol/<sr>/meta.json`) — stashes the device-config so per-volume calls (which only get the SR handle) and the datapath can recover pool/namespace/cephx key; keeps secrets out of URIs |
 | `gcjob.py` + `rbd_gc.py` | async flatten-on-delete GC (trash-rename + detached worker + sweep-on-scan) |
 | `rbdvol_lib.py`  | shared helpers (URI scheme, volume dicts, key parsing, image-meta names) |
-| `rbd_backend.py` | the dashboard REST backend (vendored from `../rbdsr/src`) |
+| `rbd_backend.py` | control-plane backends — `RestBackend` (dashboard REST) and `LocalBackend` (librbd/librados bindings, lazily imported); `make_backend()` selects on `backend=` |
 
 The per-method executables (`SR.create`, `Volume.snapshot`, …) are symlinks to the
 dispatcher modules; they switch on `argv[0]`.
@@ -57,11 +61,18 @@ lib ships only for python2 on 8.3).
 
 Namespace == SR uuid, image == VDI uuid, snapshot volume key == `<base>@<snap_uuid>`
 (same as the SMAPIv1 driver). `device-config`: `pool`, `mon_host`, `user`, `key`
-(cephx aes256k — datapath only), `ms_mode` (default: prefer-crc — crc where the
-cluster allows it, else secure), `rbd_features` (preset
-`performance` (default) | `compat`, or an explicit comma-list), `namespace`
-(default: SR uuid), `api_url`/`api_user`/`api_secret`/`api_tls_verify` (dashboard),
-`datapath` (blkback|tapdisk).
+(cephx aes256k — always the datapath, and the control plane too when
+`backend=local`), `ms_mode` (default: prefer-crc — crc where the cluster allows
+it, else secure), `rbd_features` (preset `performance` (default) | `compat`, or
+an explicit comma-list), `namespace` (default: SR uuid), `datapath`
+(blkback|tapdisk), and the control-plane selector `backend` (`rest` (default) |
+`local`) with its per-backend keys:
+
+- **`backend=rest`** (default): `api_url`, `api_user`, `api_secret`,
+  `api_tls_verify` — the ceph-mgr dashboard. No ceph userspace needed.
+- **`backend=local`**: reuses `mon_host` / `user` / `key` (or point at an
+  existing config with `ceph_conf=<path>`). Requires `python3-rbd` /
+  `python3-rados` on the host.
 
 ## Build & install
 
