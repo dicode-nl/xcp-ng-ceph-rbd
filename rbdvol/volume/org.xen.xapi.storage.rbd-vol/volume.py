@@ -15,6 +15,7 @@ from xapi.storage import log
 
 import srmeta
 import gcjob
+import cbtlog
 import rbdvol_lib as lib
 from rbd_backend import RbdBackendError
 
@@ -122,6 +123,16 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                 # Tidy the snapshot's image-meta (keyed by its original uuid;
                 # the GC only sees the trash name, so clean it here).
                 _purge_snap_meta(be, pool, ns, base, snap)
+                # tapdisk CBT: drop this snapshot's sealed cbtlog companion.
+                try:
+                    bmd = be.image_info(pool, base, namespace=ns).get("metadata") or {}
+                    sealed = cbtlog.sealed_gen(bmd, snap)
+                    if sealed:
+                        cbtlog.remove_companion(be, dconf, pool, ns, base, sealed)
+                        _rmw(be, pool, ns, base,
+                             lambda m: m.pop(cbtlog.snap_key(snap), None))
+                except RbdBackendError as e:
+                    log.debug("%s: destroy: cbtlog companion cleanup: %s" % (dbg, e))
             else:                          # a base image
                 try:
                     info = be.image_info(pool, base, namespace=ns)
@@ -135,6 +146,10 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                     if real:
                         raise Exception("VDI has %d snapshot(s); delete those first"
                                         % len(real))
+                    # base is going away: drop its cbtlog companions (live + any left).
+                    md = info.get("metadata") or {}
+                    if cbtlog.is_tapdisk(md):
+                        cbtlog.remove_all_companions(be, dconf, pool, ns, base, md)
                     if any(s.get("children") for s in snaps):
                         # a clonebase snap still has a CoW child -> trash + async GC
                         trash = gcjob.TRASH_PREFIX + _gen_uuid()
@@ -193,6 +208,15 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                 _rmw(be, pool, ns, base, _seed)
             except RbdBackendError:
                 pass
+        # tapdisk CBT: seal the current live cbtlog to this snapshot, start a
+        # fresh one (live-swaps the running tapdisk's -C via pause/unpause).
+        if cbtlog.is_tapdisk(bmd):
+            try:
+                updates = cbtlog.rotate(be, meta["dconf"], pool, ns, base,
+                                        snap_uuid, bmd, size)
+                _rmw(be, pool, ns, base, lambda m: m.update(updates))
+            except Exception as e:
+                log.debug("%s: snapshot cbtlog rotate failed: %s" % (dbg, e))
         return lib.volume_dict(meta["sr_uuid"], lib.snap_key(base, snap_uuid),
                                snap_uuid, base_name or snap_uuid, base_desc or "",
                                size, read_write=False, cbt_enabled=cbt)
@@ -307,26 +331,73 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
         _rmw(be, pool, ns, base, lambda m: m.__setitem__(dk, new_description))
         log.debug("%s: Volume.set_description %s" % (dbg, key))
 
-    # --- Changed Block Tracking (native, via rbd diff) ---
+    # --- Changed Block Tracking ---
+    # Two routes, chosen by the SR's datapath: (a) rbd-diff (needs fast-diff/
+    # object-map + the ceph-mgr /diff endpoint), datapath-agnostic; (b) tapdisk
+    # cbtlog (needs datapath=tapdisk, works on any ceph/compat image, no patch).
     @staticmethod
     def _cbt_key(snap):
         return "cbt.enabled" if snap is None else "snap.%s.cbt.enabled" % snap
 
+    @staticmethod
+    def _is_tapdisk_sr(dconf):
+        return str(dconf.get("datapath", "")).lower() == "tapdisk"
+
     def enable_cbt(self, dbg, sr, key):
-        be, pool, ns, base, snap = self._open(sr, key)
+        meta = srmeta.read(sr)
+        be = lib.backend(meta)
+        pool, ns = lib.pool_ns(meta)
+        dconf = meta["dconf"]
+        base, snap = lib.split_key(key)
+        if snap is None and self._is_tapdisk_sr(dconf):
+            info = be.image_info(pool, base, namespace=ns)
+            md = info.get("metadata") or {}
+            if cbtlog.is_tapdisk(md):
+                return                                  # already on
+            size = int(info.get("size", 0) or 0)
+            gen = cbtlog.create_companion(be, dconf, pool, ns, base, size)
+
+            def _mark(m):
+                m[cbtlog.K_ENABLED] = "1"
+                m[cbtlog.K_MODE] = cbtlog.MODE_TAPDISK
+                m[cbtlog.K_LIVE] = gen
+            _rmw(be, pool, ns, base, _mark)
+            try:                                        # if a VM is running, wire -C live
+                cbtlog.inject_running(dconf, pool, ns, base, gen)
+            except Exception as e:
+                log.debug("%s: enable_cbt inject skipped: %s" % (dbg, e))
+            log.debug("%s: Volume.enable_cbt %s (tapdisk cbtlog)" % (dbg, key))
+            return
+        # rbd-diff route
         feats = (be.image_info(pool, base, namespace=ns).get("features_name")
                  or [])
         if "fast-diff" not in feats:
-            # rbd-diff CBT needs object-map/fast-diff (rbd_features=performance).
-            # A 'compat' image can still get CBT via the tapdisk datapath (later).
             raise Exception("CBT requires fast-diff/object-map on the image "
-                            "(rbd_features 'performance'); this image is 'compat'")
+                            "(rbd_features 'performance'), or a datapath=tapdisk "
+                            "SR for the cbtlog route; this image is 'compat'")
         mk = self._cbt_key(snap)
         _rmw(be, pool, ns, base, lambda m: m.__setitem__(mk, "1"))
-        log.debug("%s: Volume.enable_cbt %s" % (dbg, key))
+        log.debug("%s: Volume.enable_cbt %s (rbd-diff)" % (dbg, key))
 
     def disable_cbt(self, dbg, sr, key):
-        be, pool, ns, base, snap = self._open(sr, key)
+        meta = srmeta.read(sr)
+        be = lib.backend(meta)
+        pool, ns = lib.pool_ns(meta)
+        dconf = meta["dconf"]
+        base, snap = lib.split_key(key)
+        if snap is None:
+            md = be.image_info(pool, base, namespace=ns).get("metadata") or {}
+            if cbtlog.is_tapdisk(md):
+                cbtlog.remove_all_companions(be, dconf, pool, ns, base, md)
+
+                def _clear(m):
+                    for k in list(m):
+                        if (k in (cbtlog.K_ENABLED, cbtlog.K_MODE, cbtlog.K_LIVE)
+                                or k.startswith("cbt.snap.")):
+                            m.pop(k, None)
+                _rmw(be, pool, ns, base, _clear)
+                log.debug("%s: Volume.disable_cbt %s (tapdisk cbtlog)" % (dbg, key))
+                return
         mk = self._cbt_key(snap)
         _rmw(be, pool, ns, base, lambda m: m.pop(mk, None))
         log.debug("%s: Volume.disable_cbt %s" % (dbg, key))
@@ -352,12 +423,20 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
         if base != base2:
             raise Exception("list_changed_blocks across different images: %s vs %s"
                             % (base, base2))
-        size = int(be.image_info(pool, base, namespace=ns).get("size", 0) or 0)
+        info = be.image_info(pool, base, namespace=ns)
+        size = int(info.get("size", 0) or 0)
         off = int(offset or 0)
         # xapi passes length=-1 to mean "to the end of the image".
         length = -1 if length is None else int(length)
         ln = (size - off) if length < 0 else length
         ln = max(0, min(ln, size - off))
+        md = info.get("metadata") or {}
+        if cbtlog.is_tapdisk(md):
+            bitmap = cbtlog.changed_bitmap(meta["dconf"], pool, ns, base, md,
+                                           from_snap, to_snap, off, ln, size)
+            log.debug("%s: Volume.list_changed_blocks %s..%s (tapdisk cbtlog)"
+                      % (dbg, key, key2))
+            return {"granularity": cbtlog.CBT_BLOCK, "bitmap": bitmap}
         whole = str(meta["dconf"].get("cbt_whole_object", "true")).lower() \
             in ("1", "true", "yes")
         try:

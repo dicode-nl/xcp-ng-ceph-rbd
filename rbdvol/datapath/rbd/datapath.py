@@ -29,8 +29,23 @@ from xapi.storage import log
 
 import srmeta
 import rbd_sysfs
+import cbtlog
+import rbdvol_lib as lib
 
 TAP_CTL = "/usr/sbin/tap-ctl"
+
+
+def _cbt_meta(dconf, pool, ns, base):
+    """Best-effort read of the base image's rbd meta (for CBT companion info).
+    Uses the stock dashboard REST -- needs NO /diff patch. Returns {} if the
+    control plane is unreachable so a plain attach still succeeds (writes just
+    won't be CBT-tracked for that attach)."""
+    try:
+        be = lib.make_backend(dconf)
+        return be.image_info(pool, base, namespace=ns).get("metadata") or {}
+    except Exception as e:
+        log.debug("cbt meta unavailable for %s: %s" % (base, e))
+        return {}
 
 
 def _parse_uri(uri):
@@ -51,10 +66,12 @@ def _resolve(uri):
 
 
 # ---- tapdisk (tap-ctl) helpers ----
-def _tap_create(dev, read_only=False):
+def _tap_create(dev, read_only=False, cbtlog_dev=None):
     cmd = [TAP_CTL, "create", "-a", "aio:%s" % dev]
     if read_only:
         cmd.append("-R")
+    if cbtlog_dev:                                    # CBT: track changed blocks
+        cmd += ["-C", cbtlog_dev]
     out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
     return out.strip().splitlines()[-1].strip()      # /dev/xen/blktap-2/tapdevN
 
@@ -85,8 +102,16 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
             pool, image, snap=snap, ms_mode=dconf.get("ms_mode", "prefer-crc"),
             read_only=read_only, namespace=ns)
         if mode == "tapdisk":
-            tapdev = _tap_create(dev, read_only=read_only)
-            log.debug("%s: Datapath.attach %s -> tapdisk %s over %s" % (dbg, uri, tapdev, dev))
+            cbtdev = None
+            if not read_only:            # track writes to the live base via -C
+                md = _cbt_meta(dconf, pool, ns, image)
+                try:
+                    cbtdev = cbtlog.attach_live(dconf, pool, ns, image, md)
+                except Exception as e:
+                    log.debug("%s: cbt live map failed: %s" % (dbg, e))
+            tapdev = _tap_create(dev, read_only=read_only, cbtlog_dev=cbtdev)
+            log.debug("%s: Datapath.attach %s -> tapdisk %s over %s%s"
+                      % (dbg, uri, tapdev, dev, " +cbt" if cbtdev else ""))
             return {"implementations": [
                 ["XenDisk", {"backend_type": "vbd3", "params": tapdev, "extra": {}}],
                 ["BlockDevice", {"path": tapdev}],
@@ -112,6 +137,11 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
             rbd_sysfs.unmap_image(pool, image, snap=snap, namespace=ns)
         except rbd_sysfs.RbdMapError as e:
             log.debug("%s: Datapath.detach unmap warning: %s" % (dbg, e))
+        if mode == "tapdisk" and snap is None:        # unmap the live cbtlog too
+            try:
+                cbtlog.detach_live(pool, ns, image, _cbt_meta(dconf, pool, ns, image))
+            except Exception as e:
+                log.debug("%s: cbt live unmap warning: %s" % (dbg, e))
 
     # Device is live for the whole attach/detach bracket; per-domain
     # activate/deactivate are no-ops for both modes.
