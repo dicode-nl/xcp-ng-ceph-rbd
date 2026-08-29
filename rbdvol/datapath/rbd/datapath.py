@@ -37,9 +37,10 @@ TAP_CTL = "/usr/sbin/tap-ctl"
 
 def _cbt_meta(dconf, pool, ns, base):
     """Best-effort read of the base image's rbd meta (for CBT companion info).
-    Uses the stock dashboard REST -- needs NO /diff patch. Returns {} if the
-    control plane is unreachable so a plain attach still succeeds (writes just
-    won't be CBT-tracked for that attach)."""
+    Uses the SR's configured control-plane backend (rest or local) via
+    make_backend -- needs NO /diff patch either way. Returns {} if the control
+    plane is unreachable so a plain attach still succeeds (writes just won't be
+    CBT-tracked for that attach)."""
     try:
         be = lib.make_backend(dconf)
         return be.image_info(pool, base, namespace=ns).get("metadata") or {}

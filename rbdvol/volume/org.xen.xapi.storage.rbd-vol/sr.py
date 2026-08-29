@@ -16,7 +16,8 @@ import gcjob
 import rbdvol_lib as lib
 from rbd_backend import RbdBackendError
 
-REQUIRED = ("pool", "mon_host", "key", "api_url")
+# keys every backend needs; api_url is additionally required for backend=rest
+REQUIRED = ("pool", "mon_host", "key")
 
 
 class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
@@ -32,7 +33,10 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
 
     def create(self, dbg, sr_uuid, configuration, name, description):
         log.debug("%s: SR.create %s" % (dbg, sr_uuid))
-        for k in REQUIRED:
+        required = REQUIRED
+        if configuration.get("backend", "rest").lower() == "rest":
+            required = REQUIRED + ("api_url",)
+        for k in required:
             if k not in configuration:
                 raise Exception("device-config missing required key: %s" % k)
         be = lib.make_backend(configuration)
