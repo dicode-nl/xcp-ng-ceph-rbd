@@ -1,0 +1,801 @@
+--- a/src/include/ceph_fs.h	2022-08-09 17:07:01.000000000 +0000
++++ b/src/include/ceph_fs.h	2026-08-29 05:55:39.000000000 +0000
+@@ -92,6 +92,7 @@
+ /* crypto algorithms */
+ #define CEPH_CRYPTO_NONE 0x0
+ #define CEPH_CRYPTO_AES  0x1
++#define CEPH_CRYPTO_AES256KRB5 0x2 /* aes256-cts-hmac-sha384-192 (RFC 8009) */
+ 
+ #define CEPH_AES_IV "cephsageyudagreg"
+ 
+--- a/src/auth/Crypto.h	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/Crypto.h	2026-08-29 06:00:18.000000000 +0000
+@@ -70,11 +70,31 @@
+ 
+   virtual ~CryptoKeyHandler() {}
+ 
++  // default cephx key-usage; only meaningful for usage-aware handlers
++  // (CryptoAES256KRB5). None/AES-128 ignore it.
++  uint32_t default_usage{0};
++
+   virtual int encrypt(const ceph::buffer::list& in,
+ 		      ceph::buffer::list& out, std::string *error) const = 0;
+   virtual int decrypt(const ceph::buffer::list& in,
+ 		      ceph::buffer::list& out, std::string *error) const = 0;
+ 
++  // usage-aware variants (RFC 8009 key derivation is per-usage). The base
++  // implementations ignore cct/usage/confounder and delegate to the plain
++  // encrypt/decrypt above, which is correct for CryptoNone and CryptoAES.
++  // CryptoAES256KRB5KeyHandler overrides them to apply the usage.
++  virtual int encrypt_ext(CephContext *cct, uint32_t usage,
++			  const ceph::buffer::list& in,
++			  const ceph::buffer::list *confounder,
++			  ceph::buffer::list& out, std::string *error) const {
++    return encrypt(in, out, error);
++  }
++  virtual int decrypt_ext(CephContext *cct, uint32_t usage,
++			  const ceph::buffer::list& in,
++			  ceph::buffer::list& out, std::string *error) const {
++    return decrypt(in, out, error);
++  }
++
+   // TODO: provide nullptr in the out::buf to get/estimate size requirements?
+   // Or maybe dedicated methods?
+   virtual std::size_t encrypt(const in_slice_t& in,
+@@ -162,6 +182,18 @@
+     ceph_assert(ckh); // Bad key?
+     return ckh->decrypt(in, out, error);
+   }
++  int encrypt_ext(CephContext *cct, uint32_t usage,
++		  const ceph::buffer::list& in, ceph::buffer::list& out,
++		  std::string *error) const {
++    ceph_assert(ckh); // Bad key?
++    return ckh->encrypt_ext(cct, usage, in, nullptr, out, error);
++  }
++  int decrypt_ext(CephContext *cct, uint32_t usage,
++		  const ceph::buffer::list& in, ceph::buffer::list& out,
++		  std::string *error) const {
++    ceph_assert(ckh); // Bad key?
++    return ckh->decrypt_ext(cct, usage, in, out, error);
++  }
+ 
+   using in_slice_t = CryptoKeyHandler::in_slice_t;
+   using out_slice_t = CryptoKeyHandler::out_slice_t;
+@@ -177,7 +209,7 @@
+     return ckh->encrypt(in, out);
+   }
+ 
+-  sha256_digest_t hmac_sha256(CephContext*, const ceph::buffer::list& in) {
++  sha256_digest_t hmac_sha256(CephContext*, const ceph::buffer::list& in) const {
+     ceph_assert(ckh);
+     return ckh->hmac_sha256(in);
+   }
+--- a/src/auth/Crypto.cc	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/Crypto.cc	2026-08-29 05:58:01.000000000 +0000
+@@ -17,8 +17,15 @@
+ #include <fcntl.h>
+ 
+ #include <openssl/aes.h>
++#include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/core_names.h>
++#include <openssl/params.h>
++#include <map>
++#include <mutex>
+ 
+ #include "Crypto.h"
++#include "common/ceph_mutex.h"
+ 
+ #include "include/ceph_assert.h"
+ #include "common/Clock.h"
+@@ -448,6 +455,385 @@
+ }
+ 
+ 
++// ---------------------------------------------------
++// AES256-CTS-HMAC-SHA384-192 (RFC 8009, krb5 enctype 20) — cephx aes256k.
++// Backported (route A) from upstream ceph src/auth/Crypto.cc. Uses OpenSSL 3.0
++// EVP AES-256-CBC-CTS (CS3) + HMAC-SHA384; per-usage keys Ke/Ki are derived
++// lazily and cached. Interop with the cluster was validated by aes256k_poc.c.
++
++class CryptoAES256KRB5 : public CryptoHandler {
++public:
++  CryptoAES256KRB5() { }
++  ~CryptoAES256KRB5() override {}
++  int get_type() const override {
++    return CEPH_CRYPTO_AES256KRB5;
++  }
++  int create(CryptoRandom *random, bufferptr& secret) override;
++  int validate_secret(const bufferptr& secret) override;
++  CryptoKeyHandler *get_key_handler(const bufferptr& secret, string& error) override;
++};
++
++struct EVPCipherDeleter {
++  void operator()(EVP_CIPHER* ptr) const noexcept {
++    if (ptr) { EVP_CIPHER_free(ptr); }
++  }
++};
++struct EVPCipherCtxDeleter {
++  void operator()(EVP_CIPHER_CTX* ptr) const noexcept {
++    if (ptr) { EVP_CIPHER_CTX_free(ptr); }
++  }
++};
++
++static constexpr const std::size_t AES256KRB5_KEY_LEN{32};
++static constexpr const std::size_t AES256KRB5_BLOCK_LEN{16};
++static constexpr const std::size_t AES256KRB5_HASH_LEN{24};
++static constexpr const std::size_t SHA384_LEN{48};
++
++class CryptoAES256KRB5KeyHandler : public CryptoKeyHandler {
++  std::unique_ptr<EVP_CIPHER, EVPCipherDeleter> cipher;
++
++  struct usage_keys {
++    ceph::bufferlist ki;
++    const unsigned char *ki_raw = nullptr;
++    ceph::bufferlist ke;
++    const unsigned char *ke_raw = nullptr;
++  };
++
++  mutable ceph::mutex lock = ceph::make_mutex("CryptoAES256KRB5KeyHandler");
++  mutable std::map<uint32_t, usage_keys> keys;
++
++  int do_init_usage_keys(uint32_t usage, usage_keys *uk, ostringstream& err) const {
++    int r = calc_kx(secret, usage, 0x55 /* Ki type */,
++                    AES256KRB5_HASH_LEN /* 192 bit */, uk->ki, err);
++    if (r < 0) {
++      return r;
++    }
++    uk->ki_raw = reinterpret_cast<const unsigned char *>(uk->ki.c_str());
++
++    r = calc_kx(secret, usage, 0xAA /* Ke type */,
++                32 /* 256 bit */, uk->ke, err);
++    if (r < 0) {
++      return r;
++    }
++    uk->ke_raw = reinterpret_cast<const unsigned char *>(uk->ke.c_str());
++    return 0;
++  }
++
++  const usage_keys *get_usage_keys(uint32_t usage) const {
++    std::unique_lock l(lock);
++    auto [it, inserted] = keys.emplace(std::piecewise_construct,
++                                       std::forward_as_tuple(usage),
++                                       std::forward_as_tuple());
++    if (inserted) {
++      std::ostringstream ss;
++      int r = do_init_usage_keys(usage, &it->second, ss);
++      if (r < 0) {
++        keys.erase(it);
++        return nullptr;
++      }
++    }
++    return &it->second;
++  }
++
++  static int calc_hmac_sha384(const unsigned char *data, int data_len,
++                              const unsigned char* hmac_key, int key_size,
++                              const unsigned char *iv, int iv_size,
++                              char *out, int out_size, ostringstream& err) {
++    unsigned int len = 0;
++    char _out[SHA384_LEN];
++    char *pout;
++    bool need_trim = (out_size < (int)sizeof(_out));
++    pout = need_trim ? _out : out;
++
++    /* IV (if any) is prepended to the data */
++    ceph::bufferlist source;
++    if (iv && iv_size > 0) {
++      ceph::bufferptr iv_buf(reinterpret_cast<const char *>(iv), iv_size);
++      source.push_back(iv_buf);
++    }
++    source.append((const char *)data, data_len);
++
++    HMAC(EVP_sha384(), hmac_key, key_size,
++         reinterpret_cast<const unsigned char *>(source.c_str()), source.length(),
++         (unsigned char *)pout, &len);
++
++    if (len != SHA384_LEN) {
++      err << "Unexpected calculated SHA384 length";
++      return -EIO;
++    }
++    if (need_trim) {
++      memcpy(out, pout, out_size);
++      len = out_size;
++    }
++    return len;
++  }
++
++  // RFC 8009 KDF: HMAC-SHA384(secret, 00000001 | usage_BE32 | type | 00 | (k*8)_BE32)[0:k]
++  static int calc_kx(const ceph::bufferptr& secret, uint32_t usage,
++                     uint8_t type, int k, ceph::bufferlist& out,
++                     ostringstream& err) {
++    unsigned char data[14];
++    data[0] = 0; data[1] = 0; data[2] = 0; data[3] = 1;    /* i = 1 */
++    data[4] = (usage >> 24) & 0xff; data[5] = (usage >> 16) & 0xff;
++    data[6] = (usage >>  8) & 0xff; data[7] =  usage        & 0xff;
++    data[8] = type; data[9] = 0;
++    uint32_t kb = (uint32_t)(k * 8);
++    data[10] = (kb >> 24) & 0xff; data[11] = (kb >> 16) & 0xff;
++    data[12] = (kb >>  8) & 0xff; data[13] =  kb        & 0xff;
++
++    ceph::bufferptr sha384(SHA384_LEN);
++    int r = calc_hmac_sha384(data, sizeof(data),
++                             reinterpret_cast<const unsigned char *>(secret.c_str()),
++                             secret.length(),
++                             nullptr, 0, /* no IV */
++                             sha384.c_str(), SHA384_LEN, err);
++    if (r < 0) {
++      return r;
++    }
++    bufferlist bl;
++    bl.append(sha384);
++    bl.splice(0, k, &out);
++    return r;
++  }
++
++  int encrypt_AES256_CTS(ceph::bufferlist& plaintext,
++                         const unsigned char* ke, const unsigned char* iv,
++                         unsigned char *ciphertext, int ciphertext_len) const {
++    if (!cipher) {
++      return -EINVAL;
++    }
++    if ((size_t)ciphertext_len < plaintext.length()) {
++      return -EINVAL;
++    }
++    OSSL_PARAM params[2] = {
++      OSSL_PARAM_construct_utf8_string(OSSL_CIPHER_PARAM_CTS_MODE, (char *)"CS3", 0),
++      OSSL_PARAM_construct_end() };
++
++    std::unique_ptr<EVP_CIPHER_CTX, EVPCipherCtxDeleter> ctx{EVP_CIPHER_CTX_new()};
++    if (!ctx) {
++      return -EIO;
++    }
++    if (!EVP_EncryptInit_ex2(ctx.get(), cipher.get(), ke, iv, params)) {
++      return -EIO;
++    }
++    int encrypted_len = 0, len;
++    if (EVP_EncryptUpdate(ctx.get(), ciphertext, &len,
++          (const unsigned char *)plaintext.c_str(), plaintext.length()) != 1) {
++      return -EIO;
++    }
++    encrypted_len += len;
++    if (EVP_EncryptFinal_ex(ctx.get(), ciphertext + encrypted_len, &len) != 1) {
++      return -EIO;
++    }
++    encrypted_len += len;
++    return encrypted_len;
++  }
++
++  int decrypt_AES256_CTS(ceph::bufferlist& ciphertext,
++                         const unsigned char* ke, const unsigned char* iv,
++                         ceph::bufferptr& plaintext) const {
++    if (!cipher) {
++      return -EINVAL;
++    }
++    OSSL_PARAM params[2] = {
++      OSSL_PARAM_construct_utf8_string(OSSL_CIPHER_PARAM_CTS_MODE, (char *)"CS3", 0),
++      OSSL_PARAM_construct_end() };
++
++    std::unique_ptr<EVP_CIPHER_CTX, EVPCipherCtxDeleter> ctx{EVP_CIPHER_CTX_new()};
++    if (!ctx) {
++      return -EIO;
++    }
++    if (!EVP_DecryptInit_ex2(ctx.get(), cipher.get(), ke, iv, params)) {
++      return -EIO;
++    }
++    int len, plaintext_len = 0;
++    auto dest = reinterpret_cast<unsigned char *>(plaintext.c_str());
++    // ciphertext.c_str() rebuilds a contiguous buffer if needed.
++    if (EVP_DecryptUpdate(ctx.get(), dest, &len,
++          (const unsigned char *)ciphertext.c_str(), ciphertext.length()) != 1) {
++      return -EIO;
++    }
++    plaintext_len += len;
++    if (EVP_DecryptFinal_ex(ctx.get(), dest + plaintext_len, &len) != 1) {
++      return -EIO;
++    }
++    plaintext_len += len;
++    return 0;
++  }
++
++public:
++  CryptoAES256KRB5KeyHandler() : CryptoKeyHandler(CryptoKeyHandler::BLOCK_SIZE_16B()) {}
++  ~CryptoAES256KRB5KeyHandler() = default;
++
++  int init(const ceph::bufferptr& s, ostringstream& err) {
++    cipher.reset(EVP_CIPHER_fetch(NULL, "AES-256-CBC-CTS", NULL));
++    if (!cipher) {
++      err << "Failed to fetch OpenSSL cipher AES-256-CBC-CTS";
++      return -EINVAL;
++    }
++    secret = s;
++    default_usage = 0;
++    // usage keys are derived lazily on first use (see get_usage_keys).
++    return 0;
++  }
++
++  // plain (usage-less) variants — route through the default usage. Not used by
++  // cephx after this backport, but required to satisfy the pure-virtual base.
++  int encrypt(const ceph::bufferlist& in, ceph::bufferlist& out,
++              std::string *error) const override {
++    return encrypt_ext(nullptr, default_usage, in, nullptr, out, error);
++  }
++  int decrypt(const ceph::bufferlist& in, ceph::bufferlist& out,
++              std::string *error) const override {
++    return decrypt_ext(nullptr, default_usage, in, out, error);
++  }
++
++  int encrypt_ext(CephContext *cct, uint32_t usage,
++                  const ceph::bufferlist& in,
++                  const ceph::bufferlist *confounder,
++                  ceph::bufferlist& out, std::string *error) const override {
++    // output layout: AES256-CTS( confounder | data ) | HMAC-SHA384[0:24]
++    ceph::bufferptr out_tmp{static_cast<unsigned>(
++      AES256KRB5_BLOCK_LEN + in.length() + AES256KRB5_HASH_LEN)};
++
++    char *aes_enc = out_tmp.c_str();
++    int aes_enc_len = AES256KRB5_BLOCK_LEN + in.length();
++
++    ceph::bufferlist incopy;
++    bufferptr confounder_buf(AES256KRB5_BLOCK_LEN);
++    if (!confounder) {
++      if (cct) {
++        cct->random()->get_bytes(confounder_buf.c_str(), confounder_buf.length());
++      } else {
++        CryptoRandom r;
++        r.get_bytes(confounder_buf.c_str(), confounder_buf.length());
++      }
++      incopy.append(confounder_buf);
++    } else {
++      if (confounder->length() != AES256KRB5_BLOCK_LEN) {
++        if (error) *error = "confounder length must equal block size";
++        return -EINVAL;
++      }
++      incopy.append(*confounder);
++    }
++    incopy.append(in);
++
++    unsigned char iv[AES256KRB5_BLOCK_LEN];
++    memset(iv, 0, sizeof(iv));
++
++    auto *uk = get_usage_keys(usage);
++    if (!uk) {
++      if (error) *error = "cannot derive usage keys";
++      return -EIO;
++    }
++
++    int r = encrypt_AES256_CTS(incopy, uk->ke_raw, iv,
++                               (unsigned char *)aes_enc, aes_enc_len);
++    if (r < 0) {
++      return r;
++    }
++    aes_enc_len = r;
++
++    char *hmac = out_tmp.c_str() + AES256KRB5_BLOCK_LEN + in.length();
++    ostringstream err;
++    r = calc_hmac_sha384((const unsigned char *)aes_enc, aes_enc_len,
++                         uk->ki_raw, uk->ki.length(),
++                         iv, sizeof(iv), hmac, AES256KRB5_HASH_LEN, err);
++    if (r < 0) {
++      if (error) *error = err.str();
++      return r;
++    }
++    out.append(out_tmp);
++    return 0;
++  }
++
++  int decrypt_ext(CephContext *cct, uint32_t usage,
++                  const ceph::bufferlist& in,
++                  ceph::bufferlist& out, std::string *error) const override {
++    if (in.length() < AES256KRB5_BLOCK_LEN + AES256KRB5_HASH_LEN) {
++      if (error) *error = "ciphertext too short";
++      return -EINVAL;
++    }
++    bufferlist incopy(in);       // shallow copy
++    ceph::bufferlist indata;
++    // split off the trailing HMAC:
++    //   indata <- AES256-CTS( confounder | plaintext )
++    //   incopy <- HMAC of indata
++    incopy.splice(0, in.length() - AES256KRB5_HASH_LEN, &indata);
++    auto& inhash = incopy;
++
++    unsigned char iv[AES256KRB5_BLOCK_LEN];
++    memset(iv, 0, sizeof(iv));
++
++    auto *uk = get_usage_keys(usage);
++    if (!uk) {
++      if (error) *error = "cannot derive usage keys";
++      return -EIO;
++    }
++
++    char hmac[AES256KRB5_HASH_LEN];
++    ostringstream err;
++    int r = calc_hmac_sha384((const unsigned char *)indata.c_str(), indata.length(),
++                             uk->ki_raw, uk->ki.length(),
++                             iv, sizeof(iv), hmac, sizeof(hmac), err);
++    if (r < 0) {
++      if (error) *error = err.str();
++      return r;
++    }
++    if ((size_t)r != inhash.length()) {
++      return -EPERM;
++    }
++    if (memcmp(hmac, inhash.c_str(), sizeof(hmac)) != 0) {
++      return -EPERM;
++    }
++
++    bufferptr tmp_out(indata.length());   // confounder | plaintext
++    r = decrypt_AES256_CTS(indata, uk->ke_raw, iv, tmp_out);
++    if (r < 0) {
++      return r;
++    }
++    if (tmp_out.length() < AES256KRB5_BLOCK_LEN) {
++      return -EPERM;
++    }
++    int data_len = tmp_out.length() - AES256KRB5_BLOCK_LEN;
++    out.append(tmp_out.c_str() + AES256KRB5_BLOCK_LEN, data_len);
++    return 0;
++  }
++};
++
++
++// ------------------------------------------------------------
++
++int CryptoAES256KRB5::create(CryptoRandom *random, bufferptr& secret)
++{
++  bufferptr buf(AES256KRB5_KEY_LEN);
++  random->get_bytes(buf.c_str(), buf.length());
++  secret = std::move(buf);
++  return 0;
++}
++
++int CryptoAES256KRB5::validate_secret(const bufferptr& secret)
++{
++  if (secret.length() < AES256KRB5_KEY_LEN) {
++    return -EINVAL;
++  }
++  return 0;
++}
++
++CryptoKeyHandler *CryptoAES256KRB5::get_key_handler(const bufferptr& secret,
++                                                    string& error)
++{
++  CryptoAES256KRB5KeyHandler *ckh = new CryptoAES256KRB5KeyHandler;
++  ostringstream oss;
++  if (ckh->init(secret, oss) < 0) {
++    error = oss.str();
++    delete ckh;
++    return NULL;
++  }
++  return ckh;
++}
++
++
+ 
+ 
+ // --
+@@ -574,6 +960,8 @@
+     return new CryptoNone;
+   case CEPH_CRYPTO_AES:
+     return new CryptoAES;
++  case CEPH_CRYPTO_AES256KRB5:
++    return new CryptoAES256KRB5;
+   default:
+     return NULL;
+   }
+--- a/src/auth/cephx/CephxProtocol.h	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/cephx/CephxProtocol.h	2026-08-29 06:00:04.000000000 +0000
+@@ -30,6 +30,20 @@
+ #define CEPHX_REQUEST_TYPE_MASK            0x0F00
+ #define CEPHX_CRYPT_ERR			1
+ 
++/* cephx key-usage values (RFC 8009 key derivation, aes256k). These MUST match
++ * the values the cluster uses per message; type-1 (AES-128) keys ignore them. */
++/* Principal <-> AuthMonitor */
++#define CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET  0x03
++#define CEPHX_KEY_USAGE_TICKET_SESSION_KEY      0x04
++#define CEPHX_KEY_USAGE_TICKET_BLOB             0x05
++/* Principal <-> Service */
++#define CEPHX_KEY_USAGE_AUTHORIZE               0x10
++#define CEPHX_KEY_USAGE_AUTHORIZE_CHALLENGE     0x11
++#define CEPHX_KEY_USAGE_AUTHORIZE_REPLY         0x12
++/* Service Daemon <-> AuthMonitor */
++#define CEPHX_KEY_USAGE_ROTATING_SECRET         0x20
++#define CEPHX_KEY_USAGE_TICKET_INFO             0x30
++
+ #include "auth/Auth.h"
+ #include <errno.h>
+ #include <sstream>
+@@ -520,4 +534,96 @@
+   return 0;
+ }
+ 
++/*
++ * usage-aware variants (aes256k / RFC 8009). Identical to the ones above but
++ * thread a cephx key-usage through to the crypto layer. For type-1 (AES-128)
++ * keys the usage is ignored, so these are safe drop-in replacements.
++ */
++template <typename T>
++void decode_decrypt_enc_bl(CephContext *cct, T& t, const CryptoKey& key,
++			   uint32_t usage, const bufferlist& bl_enc,
++			   std::string &error)
++{
++  uint64_t magic;
++  bufferlist bl;
++
++  if (key.decrypt_ext(cct, usage, bl_enc, bl, &error) < 0)
++    return;
++
++  auto iter2 = bl.cbegin();
++  __u8 struct_v;
++  decode(struct_v, iter2);
++  decode(magic, iter2);
++  if (magic != AUTH_ENC_MAGIC) {
++    ostringstream oss;
++    oss << "bad magic in decode_decrypt, " << magic << " != " << AUTH_ENC_MAGIC;
++    error = oss.str();
++    return;
++  }
++
++  decode(t, iter2);
++}
++
++template <typename T>
++void encode_encrypt_enc_bl(CephContext *cct, const T& t, const CryptoKey& key,
++			   uint32_t usage, bufferlist& out, std::string &error)
++{
++  bufferlist bl;
++  __u8 struct_v = 1;
++  encode(struct_v, bl);
++  uint64_t magic = AUTH_ENC_MAGIC;
++  encode(magic, bl);
++  encode(t, bl);
++
++  key.encrypt_ext(cct, usage, bl, out, &error);
++}
++
++template <typename T>
++int decode_decrypt(CephContext *cct, T& t, const CryptoKey& key, uint32_t usage,
++		    bufferlist::const_iterator& iter, std::string &error)
++{
++  bufferlist bl_enc;
++  try {
++    decode(bl_enc, iter);
++    decode_decrypt_enc_bl(cct, t, key, usage, bl_enc, error);
++  }
++  catch (buffer::error &e) {
++    error = "error decoding block for decryption";
++  }
++  if (!error.empty())
++    return CEPHX_CRYPT_ERR;
++  return 0;
++}
++
++template <typename T>
++int encode_encrypt(CephContext *cct, const T& t, const CryptoKey& key,
++		    uint32_t usage, bufferlist& out, std::string &error)
++{
++  bufferlist bl_enc;
++  encode_encrypt_enc_bl(cct, t, key, usage, bl_enc, error);
++  if (!error.empty()){
++    return CEPHX_CRYPT_ERR;
++  }
++  encode(bl_enc, out);
++  return 0;
++}
++
++/*
++ * Keyed hash (HMAC-SHA256) of an encodable, for uses that must be deterministic
++ * for a given key+input. aes256k's encrypt has a random confounder so its
++ * ciphertext can't be used as a derived value; a keyed hash can. Works for any
++ * key type. Output is not meant to be decoded.
++ */
++template <typename T>
++int encode_hash(CephContext *cct, const T& t, const CryptoKey& key,
++                bufferlist& out, std::string &error)
++{
++  using ceph::encode;
++  bufferlist bl_enc;
++  encode(t, bl_enc);
++  sha256_digest_t hash = key.hmac_sha256(cct, bl_enc);
++  out.append((const char *)&hash, sizeof(hash));
++  return 0;
++}
++
+ #endif
+--- a/src/auth/cephx/CephxProtocol.cc	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/cephx/CephxProtocol.cc	2026-08-29 06:02:17.000000000 +0000
+@@ -33,8 +33,20 @@
+   b.client_challenge = client_challenge;
+ 
+   bufferlist enc;
+-  if (encode_encrypt(cct, b, secret, enc, error))
+-    return;
++  switch (secret.get_type()) {
++    case CEPH_CRYPTO_AES:
++      if (encode_encrypt(cct, b, secret, enc, error))
++        return;
++      break;
++    default:
++      /*
++       * AES256KRB5 has a builtin confounder that randomizes the ciphertext,
++       * so encode_encrypt() can't be used here. Use a keyed hash instead;
++       * AES keeps encode_encrypt for backward compatibility.
++       */
++      if (encode_hash(cct, b, secret, enc, error))
++        return;
++  }
+ 
+   uint64_t k = 0;
+   const ceph_le64 *p = (const ceph_le64 *)enc.c_str();
+@@ -67,7 +79,7 @@
+   if (!info.service_secret.get_secret().length())
+     error = "invalid key";  // Bad key?
+   else
+-    encode_encrypt_enc_bl(cct, ticket_info, info.service_secret, blob.blob, error);
++    encode_encrypt_enc_bl(cct, ticket_info, info.service_secret, CEPHX_KEY_USAGE_TICKET_INFO, blob.blob, error);
+   if (!error.empty()) {
+     ldout(cct, -1) << "cephx_build_service_ticket_blob failed with error "
+ 	  << error << dendl;
+@@ -112,7 +124,7 @@
+     msg_a.session_key = info.session_key;
+     msg_a.validity = info.validity;
+     std::string error;
+-    if (encode_encrypt(cct, msg_a, principal_secret, reply, error)) {
++    if (encode_encrypt(cct, msg_a, principal_secret, CEPHX_KEY_USAGE_TICKET_SESSION_KEY, reply, error)) {
+       ldout(cct, -1) << "error encoding encrypted: " << error << dendl;
+       return false;
+     }
+@@ -130,7 +142,7 @@
+ 
+     encode((__u8)should_encrypt_ticket, reply);
+     if (should_encrypt_ticket) {
+-      if (encode_encrypt(cct, service_ticket_bl, ticket_enc_key, reply, error)) {
++      if (encode_encrypt(cct, service_ticket_bl, ticket_enc_key, CEPHX_KEY_USAGE_TICKET_BLOB, reply, error)) {
+ 	ldout(cct, -1) << "error encoding encrypted ticket: " << error << dendl;
+         return false;
+       }
+@@ -155,7 +167,7 @@
+ 
+     CephXServiceTicket msg_a;
+     std::string error;
+-    if (decode_decrypt(cct, msg_a, secret, indata, error)) {
++    if (decode_decrypt(cct, msg_a, secret, CEPHX_KEY_USAGE_TICKET_SESSION_KEY, indata, error)) {
+       ldout(cct, 0) << __func__ << " failed decode_decrypt, error is: " << error
+ 		    << dendl;
+       return false;
+@@ -168,7 +180,7 @@
+     if (ticket_enc) {
+       ldout(cct, 10) << __func__ << " got encrypted ticket" << dendl;
+       std::string error;
+-      if (decode_decrypt(cct, service_ticket_bl, session_key, indata, error)) {
++      if (decode_decrypt(cct, service_ticket_bl, session_key, CEPHX_KEY_USAGE_TICKET_BLOB, indata, error)) {
+ 	ldout(cct, 10) << __func__ << " decode_decrypt failed "
+ 		       << "with " << error << dendl;
+ 	return false;
+@@ -330,7 +342,7 @@
+   msg.nonce = a->nonce;
+ 
+   std::string error;
+-  if (encode_encrypt(cct, msg, session_key, a->bl, error)) {
++  if (encode_encrypt(cct, msg, session_key, CEPHX_KEY_USAGE_AUTHORIZE, a->bl, error)) {
+     ldout(cct, 0) << "failed to encrypt authorizer: " << error << dendl;
+     delete a;
+     return 0;
+@@ -396,9 +408,9 @@
+   }
+ 
+   std::string error;
+-  decode_decrypt_enc_bl(cct, ticket_info, service_secret, ticket_blob.blob, error);
++  decode_decrypt_enc_bl(cct, ticket_info, service_secret, CEPHX_KEY_USAGE_TICKET_INFO, ticket_blob.blob, error);
+   if (!error.empty()) {
+-    ldout(cct, 0) << "ceph_decode_ticket could not decrypt ticket info. error:" 
++    ldout(cct, 0) << "ceph_decode_ticket could not decrypt ticket info. error:"
+ 	<< error << dendl;
+     return false;
+   }
+@@ -460,7 +472,7 @@
+   if (!service_secret.get_secret().length())
+     error = "invalid key";  // Bad key?
+   else
+-    decode_decrypt_enc_bl(cct, ticket_info, service_secret, ticket.blob, error);
++    decode_decrypt_enc_bl(cct, ticket_info, service_secret, CEPHX_KEY_USAGE_TICKET_INFO, ticket.blob, error);
+   if (!error.empty()) {
+     ldout(cct, 0) << "verify_authorizer could not decrypt ticket info: error: "
+       << error << dendl;
+@@ -477,7 +489,7 @@
+ 
+   // CephXAuthorize
+   CephXAuthorize auth_msg;
+-  if (decode_decrypt(cct, auth_msg, ticket_info.session_key, indata, error)) {
++  if (decode_decrypt(cct, auth_msg, ticket_info.session_key, CEPHX_KEY_USAGE_AUTHORIZE, indata, error)) {
+     ldout(cct, 0) << "verify_authorizercould not decrypt authorize request with error: "
+       << error << dendl;
+     return false;
+@@ -492,7 +504,7 @@
+       ldout(cct,10) << __func__ << " adding server_challenge " << c->server_challenge
+ 		    << dendl;
+ 
+-      encode_encrypt_enc_bl(cct, *c, ticket_info.session_key, *reply_bl, error);
++      encode_encrypt_enc_bl(cct, *c, ticket_info.session_key, CEPHX_KEY_USAGE_AUTHORIZE_CHALLENGE, *reply_bl, error);
+       if (!error.empty()) {
+ 	ldout(cct, 10) << "verify_authorizer: encode_encrypt error: " << error << dendl;
+ 	return false;
+@@ -525,7 +537,7 @@
+     reply.connection_secret = *connection_secret;
+   }
+ #endif
+-  if (encode_encrypt(cct, reply, ticket_info.session_key, *reply_bl, error)) {
++  if (encode_encrypt(cct, reply, ticket_info.session_key, CEPHX_KEY_USAGE_AUTHORIZE_REPLY, *reply_bl, error)) {
+     ldout(cct, 10) << "verify_authorizer: encode_encrypt error: " << error << dendl;
+     return false;
+   }
+@@ -541,7 +553,7 @@
+   CephXAuthorizeReply reply;
+ 
+   std::string error;
+-  if (decode_decrypt(cct, reply, session_key, indata, error)) {
++  if (decode_decrypt(cct, reply, session_key, CEPHX_KEY_USAGE_AUTHORIZE_REPLY, indata, error)) {
+       ldout(cct, 0) << "verify_reply couldn't decrypt with error: " << error << dendl;
+       return false;
+   }
+@@ -572,7 +584,7 @@
+   if (!p.end()) {
+     std::string error;
+     CephXAuthorizeChallenge ch;
+-    decode_decrypt_enc_bl(cct, ch, session_key, challenge, error);
++    decode_decrypt_enc_bl(cct, ch, session_key, CEPHX_KEY_USAGE_AUTHORIZE_CHALLENGE, challenge, error);
+     if (!error.empty()) {
+       ldout(cct, 0) << "failed to decrypt challenge (" << challenge.length() << " bytes): "
+ 		    << error << dendl;
+@@ -583,7 +595,7 @@
+   }
+ 
+   std::string error;
+-  if (encode_encrypt(cct, msg, session_key, bl, error)) {
++  if (encode_encrypt(cct, msg, session_key, CEPHX_KEY_USAGE_AUTHORIZE, bl, error)) {
+     ldout(cct, 0) << __func__ << " failed to encrypt authorizer: " << error << dendl;
+     return false;
+   }
+--- a/src/auth/cephx/CephxClientHandler.cc	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/cephx/CephxClientHandler.cc	2026-08-29 06:05:38.000000000 +0000
+@@ -191,7 +191,7 @@
+ 	  if (cbl.length() && connection_secret) {
+ 	    auto p = cbl.cbegin();
+ 	    string err;
+-	    if (decode_decrypt(cct, *connection_secret, *session_key, p,
++	    if (decode_decrypt(cct, *connection_secret, *session_key, CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET, p,
+ 			       err)) {
+ 	      lderr(cct) << __func__ << " failed to decrypt connection_secret"
+ 			 << dendl;
+@@ -247,7 +247,7 @@
+           return -ENOENT;
+         }
+ 	std::string error;
+-	if (decode_decrypt(cct, secrets, secret_key, indata, error)) {
++	if (decode_decrypt(cct, secrets, secret_key, CEPHX_KEY_USAGE_ROTATING_SECRET, indata, error)) {
+ 	  ldout(cct, 0) << "could not set rotating key: decode_decrypt failed. error:"
+ 	    << error << dendl;
+ 	  return -EINVAL;
+--- a/src/auth/cephx/CephxKeyServer.cc	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/cephx/CephxKeyServer.cc	2026-08-29 06:05:42.000000000 +0000
+@@ -389,7 +389,7 @@
+   RotatingSecrets secrets = rotate_iter->second;
+ 
+   std::string error;
+-  if (encode_encrypt(cct, secrets, specific_key, enc_bl, error))
++  if (encode_encrypt(cct, secrets, specific_key, CEPHX_KEY_USAGE_ROTATING_SECRET, enc_bl, error))
+     return false;
+ 
+   return true;
+--- a/src/auth/cephx/CephxServiceHandler.cc	2022-08-09 17:07:01.000000000 +0000
++++ b/src/auth/cephx/CephxServiceHandler.cc	2026-08-29 06:05:46.000000000 +0000
+@@ -267,7 +267,7 @@
+ 				       connection_secret_required_len);
+ 	    }
+ 	    std::string err;
+-	    if (encode_encrypt(cct, *pconnection_secret, session_key, cbl,
++	    if (encode_encrypt(cct, *pconnection_secret, session_key, CEPHX_KEY_USAGE_AUTH_CONNECTION_SECRET, cbl,
+ 			       err)) {
+ 	      lderr(cct) << __func__ << " failed to encrypt connection secret, "
+ 			 << err << dendl;

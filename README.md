@@ -1,8 +1,7 @@
 # xcp-ng-ceph-rbd
 
 A native **Ceph RBD storage stack for XCP-ng 8.3** — the data path is the
-in-kernel Ceph client, so no `rbd`/`ceph` userspace is required on dom0. Three
-components:
+in-kernel Ceph client. Four components (the fourth optional):
 
 1. **`kernel-modules/`** — the backported in-kernel Ceph client (`libceph.ko` +
    `rbd.ko`) plus an in-kernel Kerberos5 crypto module (`krb5.ko`), giving the
@@ -23,6 +22,14 @@ components:
    userspace. Ships as `dicode-xapi-storage-volume-rbd` +
    `dicode-xapi-storage-datapath-rbd`.
 
+4. **`ceph-userspace/`** *(optional)* — the userspace companion to the kernel
+   modules: the Ceph **15.2.17 client libraries** (`librados`/`librbd` + python3
+   bindings) with the same **aes256k** cephx backport, so a dom0 can run the
+   control plane locally (the `rbdvol` local `librbd` backend) instead of the
+   dashboard REST proxy. Ships as override RPMs (`librados2`, `librbd1`,
+   `python3-rados`, `python3-rbd`, `…-0.<dist>.dicode.aes256k1`). A source patch
+   + specs; not needed if you use the dashboard-REST control plane.
+
 Runtime-validated end-to-end on XCP-ng 8.3 against a Ceph 20.2.4 cluster: full
 VDI lifecycle, native `VDI.revert`, CoW clone with async flatten-on-delete, a
 2-host pool with a shared SR, and compute live-migration (SMAPIv1); the SMAPIv3
@@ -42,6 +49,9 @@ rbdvol/           SMAPIv3 plugin (SR type rbd-vol)
   volume/org.xen.xapi.storage.rbd-vol/   volume plugin (SR + Volume + GC + metadata)
   datapath/rbd/                          datapath (blkback vbd / tapdisk vbd3)
   rpm/            dicode-xapi-storage-rbd.spec (-> volume-rbd + datapath-rbd)
+ceph-userspace/   (optional) aes256k userspace client libraries
+  patches/        ceph-15.2.17-aes256k.patch (the cephx aes256k backport)
+  rpm/            ceph-aes256k-libs.spec (slim override) + ceph.spec.dicode (full)
 ```
 
 ## Building
@@ -58,6 +68,9 @@ component's `README.md`. The datapath kmod build additionally needs the
 - `rbdsr/` — **LGPL-2.1**, derived from Petr Bena's CephRBDSR (see
   `rbdsr/README.md` for details).
 - `rbdvol/` — **LGPL-2.1** (see `rbdvol/README.md` for details).
+- `ceph-userspace/` — **LGPL-2.1**, an unofficial rebuild of the Ceph 15.2.17
+  client libraries with a cephx backport (see `ceph-userspace/README.md`). Not
+  endorsed by or affiliated with the Ceph project.
 
 No credentials are stored in this repo: all Ceph/dashboard secrets are supplied
 at runtime through `xe` SR `device-config`.
