@@ -24,7 +24,7 @@ class Implementation(xapi.storage.api.v5.plugin.Plugin_skeleton):
                             "`datapath=`."),
             "vendor": "dicode",
             "copyright": "(C) 2026 dicode",
-            "version": "0.1",
+            "version": "0.2",
             "required_api_version": "5.0",
             "features": ["VDI_MIRROR_IN"],
             "configuration": {},

@@ -50,6 +50,10 @@ def _running(image):
 def serve(dbg, image, dev, read_only=False):
     """Start (or reuse) a qemu-nbd exporting [dev] over a unix socket; return the
     socket path. Idempotent."""
+    if not os.path.exists(QEMU_NBD):
+        raise Exception(
+            "SXM receive into the blkback datapath needs %s (qemu-dp), which is "
+            "not installed." % QEMU_NBD)
     if _running(image):
         return sock(image)
     try:

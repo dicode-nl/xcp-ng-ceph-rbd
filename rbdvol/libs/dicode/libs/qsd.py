@@ -33,6 +33,18 @@ NODE = "vol"                      # the single block node inside each daemon
 BLOCK_SIZE = "4096"
 
 
+def _require_bin(path, pkg):
+    """The qemu serve mode + SXM are optional -- their tools (qemu-dp, nbd) are
+    NOT hard RPM deps (el7 rpm has no weak deps). Fail with a clear, actionable
+    error if the datapath is used in a mode whose tool is not installed, instead
+    of a raw FileNotFoundError from subprocess."""
+    if not os.path.exists(path):
+        raise Exception(
+            "qemu datapath mode needs %s (%s), which is not installed. "
+            "Install it, or use device-config datapath=blkback (default) / "
+            "datapath=tapdisk." % (path, pkg))
+
+
 def _dir(image):
     return os.path.join(_RUN, str(image))
 
@@ -74,6 +86,7 @@ def start(dbg, image, dev, export, read_only=False):
     """Start (or reuse) a per-VDI qemu-storage-daemon exporting [dev] as node
     'vol' over a unix NBD socket under export name [export]. Returns the nbd
     socket path."""
+    _require_bin(QSD, "qemu-dp")
     d = _dir(image)
     if _running(image):
         return nbd_sock(image)
@@ -127,6 +140,7 @@ def _nbd_in_use():
 def nbd_attach(dbg, image, export):
     """Wire the storage-daemon's unix NBD export to a free /dev/nbdX (kernel
     nbd-client). Returns the device path and remembers it for detach."""
+    _require_bin(NBD_CLIENT, "nbd")
     _ensure_nbd_module()
     sock = nbd_sock(image)
     used = _nbd_in_use()

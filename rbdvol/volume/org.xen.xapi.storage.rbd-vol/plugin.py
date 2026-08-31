@@ -31,7 +31,7 @@ class Implementation(xapi.storage.api.v5.plugin.Plugin_skeleton):
                             "krbd (aes256k/msgr2-secure) as a raw block device."),
             "vendor": "dicode",
             "copyright": "(C) 2026 dicode",
-            "version": "0.1",
+            "version": "0.2",
             "required_api_version": "5.0",
             # Keep this list in LOCKSTEP with the Volume.* executables we actually
             # ship (advertising a feature whose method is missing => runtime errors).
