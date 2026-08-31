@@ -16,7 +16,7 @@ python3, stdlib only.
 
 import re
 
-from rbd_backend import make_backend
+from dicode.libs.rbd_backend import make_backend
 
 DATAPATH_SCHEME = "rbd"
 UUID_RE = re.compile(
@@ -70,6 +70,8 @@ def snap_key(base_image, snap_uuid):
 
 
 def volume_uri(sr_uuid, key):
+    # One "rbd" datapath serves every SR; the blkback/tapdisk/qemu serve mode is
+    # an internal choice (device-config `datapath=`), NOT a separate scheme.
     return "%s://%s/%s" % (DATAPATH_SCHEME, sr_uuid, key)
 
 

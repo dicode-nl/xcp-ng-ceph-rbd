@@ -503,7 +503,20 @@ class LocalBackend(RbdBackend):
             self._cluster.connect(timeout=self.CONNECT_TIMEOUT)
         except Exception as e:
             raise RbdBackendError("cannot connect to ceph (backend=local): %s" % e)
+        # librados segfaults if the Rados object is GC'd at interpreter exit
+        # without a clean shutdown (intermittent SIGSEGV, e.g. SR.stat under the
+        # rapid polling of an SXM migration). Shut it down explicitly at exit.
+        import atexit
+        atexit.register(self._safe_shutdown)
         _log("connected via librbd (backend=local)")
+
+    def _safe_shutdown(self):
+        try:
+            if getattr(self, "_cluster", None) is not None:
+                self._cluster.shutdown()
+                self._cluster = None
+        except Exception:
+            pass
 
     # ---- helpers ----
     def _feats_to_names(self, bitmask):
@@ -527,10 +540,23 @@ class LocalBackend(RbdBackend):
     # ---- RbdBackend API ----
     @_map_rbd_errors
     def list_images(self, pool, namespace=""):
+        # Return the SAME full per-image info as image_info (size, metadata,
+        # snapshots, disk_usage) -- SR.ls relies on it: a bare {name} listing
+        # makes SR.ls report virtual_size=0 (+ lose metadata/snapshots) for every
+        # VDI, which xapi then persists on every scan (breaks VDI sizes + SXM).
         with self._ioctx(pool, namespace) as ioctx:
             # the ioctx namespace scopes the listing -> no cross-namespace leak
-            return [{"name": n, "namespace": namespace or ""}
-                    for n in self._inst.list(ioctx)]
+            names = list(self._inst.list(ioctx))
+        out = []
+        for n in names:
+            try:
+                out.append(self.image_info(pool, n, namespace=namespace))
+            except Exception:
+                # raced with a create/delete (or transiently busy): a bare entry
+                # would zero the VDI in xapi, so drop it -- the next scan re-adds
+                # it once it settles.
+                continue
+        return out
 
     @_map_rbd_errors
     def image_info(self, pool, image, namespace=""):

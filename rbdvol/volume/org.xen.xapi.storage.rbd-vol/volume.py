@@ -13,11 +13,11 @@ import uuid
 import xapi.storage.api.v5.volume
 from xapi.storage import log
 
-import srmeta
-import gcjob
-import cbtlog
-import rbdvol_lib as lib
-from rbd_backend import RbdBackendError
+from dicode.libs import srmeta
+from dicode.libs import gcjob
+from dicode.libs import cbtlog
+from dicode.libs import rbdvol_lib as lib
+from dicode.libs.rbd_backend import RbdBackendError
 
 CLONE_SNAP_PREFIX = "xcp-clonebase-"
 

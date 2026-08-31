@@ -18,13 +18,15 @@ class Implementation(xapi.storage.api.v5.plugin.Plugin_skeleton):
         return {
             "plugin": "rbd",
             "name": "Ceph RBD datapath",
-            "description": ("Maps RBD images via native krbd (/sys/bus/rbd) to a raw "
-                            "block device served by kernel blkback (backend_type vbd)."),
+            "description": ("Maps RBD images via native krbd (/sys/bus/rbd) and "
+                            "serves them in one of three modes (blkback / tapdisk "
+                            "/ qemu-storage-daemon), chosen per-SR by device-config "
+                            "`datapath=`."),
             "vendor": "dicode",
             "copyright": "(C) 2026 dicode",
             "version": "0.1",
             "required_api_version": "5.0",
-            "features": [],
+            "features": ["VDI_MIRROR_IN"],
             "configuration": {},
             "required_cluster_stack": []}
 

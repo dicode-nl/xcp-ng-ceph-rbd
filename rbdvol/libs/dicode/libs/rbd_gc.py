@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover
     def _log(msg):
         sys.stderr.write("[rbd-vol gc] " + msg + "\n")
 
-from rbd_backend import make_backend, RbdBackendError
+from dicode.libs.rbd_backend import make_backend, RbdBackendError
 
 FLATTEN_RETRIES = 4
 RETRY_SLEEP = 10

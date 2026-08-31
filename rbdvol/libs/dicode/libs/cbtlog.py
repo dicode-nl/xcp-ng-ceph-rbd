@@ -29,7 +29,7 @@ import base64
 import subprocess
 import uuid
 
-import rbd_sysfs
+from dicode.libs import rbd_sysfs
 
 CBT_BLOCK = 65536                 # 64 KiB, the XAPI CBT granularity
 _HEADER = 64                      # cbt-util header (48 real), rounded for margin

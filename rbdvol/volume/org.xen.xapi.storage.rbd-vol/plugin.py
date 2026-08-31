@@ -40,6 +40,10 @@ class Implementation(xapi.storage.api.v5.plugin.Plugin_skeleton):
             #     'performance' preset + the ceph-mgr /diff endpoint, or backend=local).
             # Still to come: copy/mirror via the separate Data plugin (snapshot-diff
             # or opt-in tapdisk datapath) for backup/SXM. compose is N/A for raw RBD.
+            # VDI_MIRROR advertises the SR-level mirror capability so xapi allows
+            # VDI.pool_migrate (SXM). The actual mirror runs in the *datapath*
+            # plugin (DATA.mirror/Datapath.import_activate, which declares
+            # VDI_MIRROR_IN) and only works with the tapdisk datapath.
             "features": [
                 "VDI_CREATE",
                 "VDI_DESTROY",
@@ -47,6 +51,7 @@ class Implementation(xapi.storage.api.v5.plugin.Plugin_skeleton):
                 "VDI_SNAPSHOT",
                 "VDI_CLONE",
                 "VDI_CONFIG_CBT",
+                "VDI_MIRROR",
             ],
             "configuration": {},
             "required_cluster_stack": []}

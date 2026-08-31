@@ -11,10 +11,10 @@ import sys
 import xapi.storage.api.v5.volume
 from xapi.storage import log
 
-import srmeta
-import gcjob
-import rbdvol_lib as lib
-from rbd_backend import RbdBackendError
+from dicode.libs import srmeta
+from dicode.libs import gcjob
+from dicode.libs import rbdvol_lib as lib
+from dicode.libs.rbd_backend import RbdBackendError
 
 # keys every backend needs; api_url is additionally required for backend=rest
 REQUIRED = ("pool", "mon_host", "key")
@@ -161,7 +161,8 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
                 ssize = int(snap.get("size", size) or size)
                 sn, sd, sk = lib.meta_view(md, sname, sname)
                 out.append(lib.volume_dict(sr_uuid, key, sname, sn, sd, ssize,
-                                           read_write=False, keys=sk, cbt_enabled=cbt))
+                                           read_write=False, keys=sk,
+                                           cbt_enabled=cbt))
         return out
 
     def set_name(self, dbg, sr, new_name):
