@@ -15,7 +15,7 @@
 # (cf. xcp-ng-xapi-storage-{libs,volume-zfsvol,datapath-tapdisk}) plus a thin meta.
 Name:           dicode-xapi-storage-rbd
 Version:        0.2
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Ceph RBD SMAPIv3 storage plugin for XCP-ng (meta: libs + volume + datapath)
 
 License:        LGPL-2.1-only
@@ -146,15 +146,21 @@ done
 %post -n dicode-xapi-storage-volume-rbd
 # v3 plugins are discovered by directory (no sm-plugins whitelist); nudge the
 # storage-script to rescan. A toolstack restart registers the SR type in xapi.
-systemctl try-restart xapi-storage-script.service >/dev/null 2>&1 || :
+systemctl try-restart --no-block xapi-storage-script.service >/dev/null 2>&1 || :
 echo "NOTE: rbd-vol SMAPIv3 volume plugin installed."
 echo "      Run 'xe-toolstack-restart' on each pool host to register SR type 'rbd-vol'"
 echo "      (VDI_MIRROR/VDI_MIRROR_IN only promote once every host has re-registered)."
 
 %post -n dicode-xapi-storage-datapath-rbd
-systemctl try-restart xapi-storage-script.service >/dev/null 2>&1 || :
+systemctl try-restart --no-block xapi-storage-script.service >/dev/null 2>&1 || :
 
 %changelog
+* Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-4
+- %post: restart xapi-storage-script with --no-block. A blocking try-restart hung
+  the whole rpm transaction whenever the service was slow/stuck to deactivate; the
+  restart is only a rescan-nudge (plugin scripts are exec'd fresh per call), so it
+  must not block the install.
+
 * Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-3
 - Cross-host live storage migration into the qemu/blkback rbd-vol datapath now
   works (VM node->node + a qemu disk -> blkback), validated md5-identical.
