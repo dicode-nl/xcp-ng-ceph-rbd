@@ -15,7 +15,7 @@
 # (cf. xcp-ng-xapi-storage-{libs,volume-zfsvol,datapath-tapdisk}) plus a thin meta.
 Name:           dicode-xapi-storage-rbd
 Version:        0.2
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Ceph RBD SMAPIv3 storage plugin for XCP-ng (meta: libs + volume + datapath)
 
 License:        LGPL-2.1-only
@@ -155,6 +155,18 @@ echo "      (VDI_MIRROR/VDI_MIRROR_IN only promote once every host has re-regist
 systemctl try-restart xapi-storage-script.service >/dev/null 2>&1 || :
 
 %changelog
+* Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-2
+- Live storage migration onto a NATIVE (blkback) rbd-vol SR now works
+  (qemu-mode source -> blkback destination), validated md5 + reproducible.
+- blkback datapath is a valid SXM destination: start the receive qemu-nbd
+  (blknbd) ONLY for the mirror-VM attach (non-numeric domain), keeping guest
+  attaches pure kernel blkback; advertise the live Nbd in that attach.
+- Fix blknbd hang: detach qemu-nbd's stdio (its --fork does not close it, so
+  the daemon held xapi's get_nbd_server result pipe open).
+- Volume.destroy self-heals a stuck image: stop any per-image blknbd/qsd and
+  unmap krbd before delete, so a failed/aborted SXM no longer leaks the dest
+  image + qemu-nbd + krbd map ("RBD image is busy").
+
 * Sun Aug 31 2026 dicode <info@dicode.nl> - 0.2-1
 - Refactor: shared code moved into a python3 site-packages package `dicode.libs`,
   split out as the new dicode-xapi-storage-libs-rbd subpackage; volume + datapath
