@@ -30,6 +30,18 @@ def _features(meta):
     return lib.resolve_features(meta["dconf"].get("rbd_features"))
 
 
+def _from_sxm(dbg):
+    """True when this Volume.destroy is part of a storage migration. xapi threads
+    the migrate op through the debug string (e.g. "VM.migrate_send R:...",
+    "VDI.pool_migrate R:..."). Only THERE do we cascade-remove a base's rbd
+    snapshots -- they're already copied to the destination, or it's a failed temp
+    copy being rolled back. A normal user delete is refused instead (an rbd
+    snapshot can't outlive its base, so cascading would silently lose real
+    snapshots -- unlike a VHD SR where snapshots survive a base delete)."""
+    d = (dbg or "").lower()
+    return "migrate" in d or "sxm" in d
+
+
 def _remove_snap(be, pool, ns, base_image, snap_name):
     # Only ever called for a snapshot with NO children -- destroy() hands a snap
     # that still has CoW clones to the background GC (trash-rename + rbd_gc.py),
@@ -163,21 +175,28 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                         raise
                 if info:
                     snaps = info.get("snapshots", []) or []
-                    real = [s for s in snaps if lib.UUID_RE.match(s.get("name") or "")]
-                    if real:
-                        raise Exception("VDI has %d snapshot(s); delete those first"
-                                        % len(real))
-                    # base is going away: drop its cbtlog companions (live + any left).
+                    real = [s for s in snaps
+                            if lib.UUID_RE.match(s.get("name") or "")]
+                    # A base with REAL (user) snapshots: refuse a normal delete so
+                    # they aren't silently lost (an rbd snapshot lives INSIDE the
+                    # base image and can't outlive it -- unlike a VHD SR where a
+                    # snapshot survives a base delete). But xapi's SXM cleanup
+                    # destroys the base directly (its snapshots are already copied
+                    # to the destination, or it's a failed temp copy), so THERE we
+                    # cascade. Either way, below: childless snaps are removed then
+                    # the base; a snap with a live CoW CHILD -> trash + async GC.
+                    if real and not _from_sxm(dbg):
+                        raise Exception("VDI has %d snapshot(s); delete those "
+                                        "first" % len(real))
                     md = info.get("metadata") or {}
                     if cbtlog.is_tapdisk(md):
                         cbtlog.remove_all_companions(be, dconf, pool, ns, base, md)
                     if any(s.get("children") for s in snaps):
-                        # a clonebase snap still has a CoW child -> trash + async GC
                         trash = gcjob.TRASH_PREFIX + _gen_uuid()
                         be.image_rename(pool, base, trash, namespace=ns)
                         gcjob.spawn(dconf, pool, ns, "image", trash)
                     else:
-                        for s in snaps:    # childless internal clonebase snaps
+                        for s in snaps:    # childless snapshots: unprotect + remove
                             _remove_snap(be, pool, ns, base, s.get("name"))
                         _force_release(dbg, pool, ns, base)
                         be.remove(pool, base, namespace=ns)
