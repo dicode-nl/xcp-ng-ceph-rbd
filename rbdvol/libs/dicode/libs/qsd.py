@@ -28,6 +28,13 @@ from xapi.storage import log
 
 QSD = "/usr/lib64/qemu-dp/bin/qemu-storage-daemon"
 NBD_CLIENT = "/usr/sbin/nbd-client"
+# xapi's own nbd<->/dev/nbdX manager. Using it (rather than nbd-client directly)
+# is REQUIRED for correctness: connect writes /var/run/nonpersistent/nbd/<N>, the
+# connect-info file that xapi's vhd-tool copy path reads to follow /dev/nbdN back
+# to its NBD server -- without it VDI.copy TO this datapath dies with ENOENT on
+# that file. It also shares xapi's FILE_LOCK, so we never race xapi for a device.
+NBD_MANAGER = "/opt/xensource/libexec/nbd_client_manager.py"
+_PERSIST_DIR = "/var/run/nonpersistent/nbd"
 _RUN = "/run/rbd-qsd"
 NODE = "vol"                      # the single block node inside each daemon
 BLOCK_SIZE = "4096"
@@ -137,12 +144,36 @@ def _nbd_in_use():
     return used
 
 
+def _persist_nbd_info(dev, sock, export):
+    """Write the connect-info file xapi's copy path expects for /dev/nbdN (fallback
+    for when nbd_client_manager.py is absent; the manager writes it itself)."""
+    num = os.path.basename(dev)[len("nbd"):]
+    try:
+        os.makedirs(_PERSIST_DIR)
+    except OSError:
+        pass
+    with open(os.path.join(_PERSIST_DIR, num), "w") as f:
+        f.write(json.dumps({"path": sock, "exportname": export}))
+
+
 def nbd_attach(dbg, image, export):
-    """Wire the storage-daemon's unix NBD export to a free /dev/nbdX (kernel
-    nbd-client). Returns the device path and remembers it for detach."""
-    _require_bin(NBD_CLIENT, "nbd")
+    """Wire the storage-daemon's unix NBD export to a free /dev/nbdX. Prefer xapi's
+    nbd_client_manager.py -- it writes the /var/run/nonpersistent/nbd/<N> info file
+    that vhd-tool needs (so VDI.copy TO this SR works) and holds xapi's device
+    lock. Returns the device path and remembers it for detach."""
     _ensure_nbd_module()
     sock = nbd_sock(image)
+    if os.path.exists(NBD_MANAGER):
+        dev = subprocess.check_output(
+            [NBD_MANAGER, "connect", "--path", sock, "--exportname", export],
+            stderr=subprocess.STDOUT).decode().strip()
+        with open(_nbd_file(image), "w") as fd:
+            fd.write(dev)
+        log.debug("%s: qsd nbd_attach %s -> %s (export %s, via manager)"
+                  % (dbg, sock, dev, export))
+        return dev
+    # Fallback: no manager -- wire nbd-client ourselves AND write the info file.
+    _require_bin(NBD_CLIENT, "nbd")
     used = _nbd_in_use()
     names = sorted((n for n in os.listdir("/dev")
                     if n.startswith("nbd") and n[3:].isdigit()),
@@ -163,6 +194,7 @@ def nbd_attach(dbg, image, export):
                 fd.write("none")
         except Exception:
             pass
+        _persist_nbd_info(dev, sock, export)
         with open(_nbd_file(image), "w") as fd:
             fd.write(dev)
         log.debug("%s: qsd nbd_attach %s -> %s (export %s)"
@@ -180,12 +212,24 @@ def find_nbd(image):
 
 
 def nbd_detach(dbg, dev):
+    if os.path.exists(NBD_MANAGER):
+        try:
+            subprocess.check_call([NBD_MANAGER, "disconnect", "--device", dev],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.STDOUT)
+            return
+        except Exception as e:
+            log.debug("%s: nbd manager disconnect %s: %s" % (dbg, dev, e))
     try:
         subprocess.check_call([NBD_CLIENT, "-d", dev],
                               stdout=subprocess.DEVNULL,
                               stderr=subprocess.STDOUT)
     except Exception as e:
         log.debug("%s: nbd-client -d %s: %s" % (dbg, dev, e))
+    try:
+        os.unlink(os.path.join(_PERSIST_DIR, os.path.basename(dev)[len("nbd"):]))
+    except OSError:
+        pass
 
 
 def stop(dbg, image):
