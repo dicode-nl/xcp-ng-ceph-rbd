@@ -15,7 +15,7 @@
 # (cf. xcp-ng-xapi-storage-{libs,volume-zfsvol,datapath-tapdisk}) plus a thin meta.
 Name:           dicode-xapi-storage-rbd
 Version:        0.2
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Ceph RBD SMAPIv3 storage plugin for XCP-ng (meta: libs + volume + datapath)
 
 License:        LGPL-2.1-only
@@ -155,6 +155,14 @@ echo "      (VDI_MIRROR/VDI_MIRROR_IN only promote once every host has re-regist
 systemctl try-restart --no-block xapi-storage-script.service >/dev/null 2>&1 || :
 
 %changelog
+* Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-5
+- Fix VM crash on a storage-script restart with a tapdisk-mode disk: our tapdisks
+  were spawned into the xapi-storage-script control-group, so a restart of that
+  daemon (KillMode=control-group; our %post or xe-toolstack-restart) tore down the
+  guest-serving tapdisk. Move each new tapdisk to the same cgroups XCP-ng's own
+  tapdisks use (cpu,blkio:/vm.slice, memory:/control.slice,
+  name=systemd:.../forkexecd.service). Also removes the 90s deactivate hang.
+
 * Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-4
 - %post: restart xapi-storage-script with --no-block. A blocking try-restart hung
   the whole rpm transaction whenever the service was slow/stuck to deactivate; the
