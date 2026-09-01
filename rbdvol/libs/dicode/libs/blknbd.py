@@ -37,6 +37,10 @@ def _pid_file(image):
     return os.path.join(_dir(image), "pid")
 
 
+def _log_file(image):
+    return os.path.join(_dir(image), "qemu-nbd.log")
+
+
 def _running(image):
     try:
         with open(_pid_file(image)) as f:
@@ -70,16 +74,30 @@ def serve(dbg, image, dev, read_only=False):
            "--aio", "native", "--discard", "unmap"]
     if read_only:
         cmd.append("--read-only")
-    cmd += ["--fork", dev]                            # parent exits once ready
+    cmd.append(dev)
     log.debug("%s: blknbd serve: %s" % (dbg, " ".join(cmd)))
-    subprocess.check_call(cmd)
-    for _ in range(50):
+    # Launch DETACHED, with NO inherited stdio. qemu-nbd --persistent runs forever,
+    # so we must not wait on it; and its --fork does NOT close stdio, so a forked
+    # daemon would inherit -- and hold open -- the caller's stdout, which is the
+    # pipe xapi reads DATA.get_nbd_server's result from. That kept the read from
+    # ever seeing EOF and hung the whole SXM receive. So: own session (survives the
+    # short-lived script), stdio to a log file, and poll for the socket instead.
+    logf = open(_log_file(image), "ab", 0)
+    devnull = open(os.devnull, "rb")
+    try:
+        proc = subprocess.Popen(cmd, stdin=devnull, stdout=logf, stderr=logf,
+                                start_new_session=True, close_fds=True)
+    finally:
+        logf.close()
+        devnull.close()
+    for _ in range(100):
         if os.path.exists(sock(image)):
-            break
+            return sock(image)
+        if proc.poll() is not None:
+            raise Exception("blknbd: qemu-nbd exited rc=%s (see %s)"
+                            % (proc.returncode, _log_file(image)))
         time.sleep(0.1)
-    if not os.path.exists(sock(image)):
-        raise Exception("blknbd: socket never appeared: %s" % sock(image))
-    return sock(image)
+    raise Exception("blknbd: socket never appeared: %s" % sock(image))
 
 
 def stop(dbg, image):
@@ -93,7 +111,7 @@ def stop(dbg, image):
             if not _running(image):
                 break
             time.sleep(0.1)
-    for p in (sock(image), _pid_file(image)):
+    for p in (sock(image), _pid_file(image), _log_file(image)):
         try:
             os.unlink(p)
         except OSError:

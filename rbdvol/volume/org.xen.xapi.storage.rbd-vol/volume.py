@@ -41,6 +41,27 @@ def _remove_snap(be, pool, ns, base_image, snap_name):
     be.snap_remove(pool, base_image, snap_name, namespace=ns)
 
 
+def _force_release(dbg, pool, ns, image):
+    """Best-effort LOCAL release before deleting a base image. A failed/aborted SXM
+    leaves the receive-side qemu-nbd (blknbd) -- and the krbd map it sits on --
+    still holding the dest leaf, so the control-plane remove hits 'RBD image is
+    busy [errno 16]' and the image + qemu-nbd + map leak. Stop any per-image NBD
+    server WE run and unmap krbd here first, dropping the RBD watchers so the
+    delete succeeds. A no-op for a normally-detached VDI (nothing running, not
+    mapped); only releases holders on THIS host."""
+    from dicode.libs import blknbd, qsd, rbd_sysfs
+    for stop in (blknbd.stop, qsd.stop):
+        try:
+            stop(dbg, image)
+        except Exception as e:
+            log.debug("%s: force_release stop %s: %s" % (dbg, image, e))
+    try:
+        if rbd_sysfs.find_device(pool, image, namespace=ns):
+            rbd_sysfs.unmap_image(pool, image, force=True, namespace=ns)
+    except Exception as e:
+        log.debug("%s: force_release unmap %s: %s" % (dbg, image, e))
+
+
 def _snap_has_children(be, pool, ns, base_image, snap_name):
     try:
         info = be.image_info(pool, base_image, namespace=ns)
@@ -158,8 +179,10 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                     else:
                         for s in snaps:    # childless internal clonebase snaps
                             _remove_snap(be, pool, ns, base, s.get("name"))
+                        _force_release(dbg, pool, ns, base)
                         be.remove(pool, base, namespace=ns)
                 else:
+                    _force_release(dbg, pool, ns, base)
                     be.remove(pool, base, namespace=ns)
         except RbdBackendError as e:
             if not e.not_found:

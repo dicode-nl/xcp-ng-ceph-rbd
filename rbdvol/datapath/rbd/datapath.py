@@ -64,7 +64,7 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
         elif mode == "qemu":
             impls = dp_qemu.attach(dbg, image, snap, dev)
         else:
-            impls = dp_blkback.attach(dbg, image, snap, dev)
+            impls = dp_blkback.attach(dbg, image, snap, dev, domain)
         return {"implementations": impls}
 
     def detach(self, dbg, uri, domain):

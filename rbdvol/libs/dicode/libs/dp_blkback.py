@@ -15,18 +15,39 @@ from dicode.libs import blknbd
 from dicode.libs import rbd_sysfs
 
 
-def attach(dbg, image, snap, dev):
-    log.debug("%s: attach %s -> %s (blkback)" % (dbg, image, dev))
-    return [
+def _is_sxm_domain(domain):
+    """xapi's get_nbd_server (bridge main.ml) provides the SXM NBD server by
+    RE-ATTACHING with domain = the raw mirror VM string ("MIR<hex>"), and
+    receive_start3 attaches the dest with the same. A normal guest VBD plug
+    attaches with domain = the numeric domid. So a non-numeric domain marks the
+    SXM-receive attach -- the only case that needs an NBD server. (dom0 also maps
+    to a non-numeric "u0-<dp>", which for blkback only occurs for such transfers.)"""
+    return not str(domain).isdigit()
+
+
+def attach(dbg, image, snap, dev, domain):
+    # Pure kernel blkback for a guest: hand xenopsd the raw /dev/rbdN (BlockDevice
+    # wins in params_of_backend -> type=phy -> kernel blkback, no userspace
+    # process). The bridge's get_nbd_server does NOT call our DATA.get_nbd_server
+    # script; it re-attaches and reads the Nbd uri from THIS response, then
+    # connects to that socket -- so for an SXM RECEIVE the qemu-nbd must be LIVE
+    # here and the Nbd advertised (also needed by receive_start3's
+    # nbd_export_of_attach_info, else "Cannot parse nbd uri"). We start it ONLY for
+    # the SXM (mirror-VM) attach, so guest attaches stay a pure kernel datapath.
+    impls = [
         ["XenDisk", {"backend_type": "vbd", "params": dev, "extra": {}}],
         ["BlockDevice", {"path": dev}],
-        # SXM-dest handle: receive_start3 only reads the exportname from this Nbd;
-        # the actual qemu-nbd server is started lazily by get_nbd_server, so a
-        # plain guest attach never spawns it. BlockDevice still wins in xenopsd's
-        # params_of_backend, so the guest is served by blkback either way.
-        ["Nbd", {"uri": "nbd:unix:%s:exportname=%s"
-                        % (blknbd.sock(image), blknbd.export(image))}],
     ]
+    if _is_sxm_domain(domain):
+        sock = blknbd.serve(dbg, image, dev, read_only=(snap is not None))
+        impls.append(["Nbd", {"uri": "nbd:unix:%s:exportname=%s"
+                              % (sock, blknbd.export(image))}])
+        log.debug("%s: attach %s -> %s (blkback SXM-dest dom=%s, nbd %s)"
+                  % (dbg, image, dev, domain, sock))
+    else:
+        log.debug("%s: attach %s -> %s (blkback guest dom=%s)"
+                  % (dbg, image, dev, domain))
+    return impls
 
 
 def detach(dbg, image):
