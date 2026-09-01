@@ -15,7 +15,7 @@
 # (cf. xcp-ng-xapi-storage-{libs,volume-zfsvol,datapath-tapdisk}) plus a thin meta.
 Name:           dicode-xapi-storage-rbd
 Version:        0.2
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Ceph RBD SMAPIv3 storage plugin for XCP-ng (meta: libs + volume + datapath)
 
 License:        LGPL-2.1-only
@@ -155,6 +155,18 @@ echo "      (VDI_MIRROR/VDI_MIRROR_IN only promote once every host has re-regist
 systemctl try-restart xapi-storage-script.service >/dev/null 2>&1 || :
 
 %changelog
+* Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-3
+- Cross-host live storage migration into the qemu/blkback rbd-vol datapath now
+  works (VM node->node + a qemu disk -> blkback), validated md5-identical.
+- qemu datapath VDI.copy/move fix: wire /dev/nbdX via xapi's
+  nbd_client_manager.py so vhd-tool's copy path finds the connect-info file
+  (VDI_COPY_FAILED ENOENT /var/run/nonpersistent/nbd/N otherwise).
+- Volume.destroy gate: cascade-remove a base's rbd snapshots ONLY during SXM
+  (dbg tagged migrate), refuse a normal user delete (protect real snapshots) --
+  fixes the SXM base+snapshot cleanup leak that broke cross-host migration.
+- Per-SR physical usage: SR.stat reports this SR's namespace allocation instead
+  of the shared pool-wide figure (an empty SR no longer shows the pool as full).
+
 * Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-2
 - Live storage migration onto a NATIVE (blkback) rbd-vol SR now works
   (qemu-mode source -> blkback destination), validated md5 + reproducible.
