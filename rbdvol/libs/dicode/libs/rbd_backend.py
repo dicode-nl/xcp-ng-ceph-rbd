@@ -88,6 +88,21 @@ class RbdBackend(object):
     def pool_stats(self, pool):
         """-> {'total':bytes,'used':bytes,'free':bytes}."""
         raise NotImplementedError
+
+    def namespace_used(self, pool, namespace=""):
+        """Total ACTUALLY-ALLOCATED bytes of every image in [namespace] -- the
+        basis for PER-SR physical usage (SRs share one ceph pool via namespaces,
+        so pool_stats is pool-wide and identical for every SR on the pool). Sums
+        each image's real allocation: the dashboard's total_disk_usage (reliable,
+        where the head-only disk_usage can read 0 with a stale object-map);
+        LocalBackend already fills disk_usage with the same du. Concrete here so
+        both backends share it -- one bulk list on REST, a per-image du on local.
+        Fast: images carry fast-diff/object-map, so du reads the map, not objects."""
+        total = 0
+        for im in self.list_images(pool, namespace=namespace):
+            total += int(im.get("total_disk_usage") or im.get("disk_usage") or 0)
+        return total
+
     def namespace_list(self, pool):
         """-> list of namespace names."""
         raise NotImplementedError

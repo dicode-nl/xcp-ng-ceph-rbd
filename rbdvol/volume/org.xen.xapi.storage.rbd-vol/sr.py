@@ -90,18 +90,29 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
     def stat(self, dbg, sr):
         meta = srmeta.read(sr)
         be = lib.backend(meta)
-        pool, _ = lib.pool_ns(meta)
+        pool, ns = lib.pool_ns(meta)
         try:
-            s = be.pool_stats(pool)
+            free = int(be.pool_stats(pool).get("free", 0))
         except RbdBackendError:
-            s = {"total": 0, "free": 0}
+            free = 0
+        # PER-SR usage. Every rbd-vol/rbd SR is a namespace in ONE shared ceph
+        # pool, so pool_stats is pool-wide -- reporting it verbatim makes an empty
+        # SR look as full as the whole pool. Instead report this SR's own
+        # allocation (sum of its namespace's image du) as the utilisation, and the
+        # real shared pool free as free_space: total_space = used + free, so
+        # xapi's physical_utilisation (= total - free) == this SR's used, while
+        # free_space stays the honest shared headroom the SR can still grow into.
+        try:
+            used = be.namespace_used(pool, ns)
+        except RbdBackendError:
+            used = 0
         return {
             "sr": sr,
             "uuid": meta["sr_uuid"],
             "name": meta.get("name", ""),
             "description": meta.get("description", ""),
-            "total_space": int(s.get("total", 0)),
-            "free_space": int(s.get("free", 0)),
+            "total_space": used + free,
+            "free_space": free,
             "datasources": [],
             "clustered": True,        # RBD is shared/cluster storage
             "health": ["Healthy", ""],
@@ -130,7 +141,10 @@ class Implementation(xapi.storage.api.v5.volume.SR_skeleton):
             if not name or not lib.UUID_RE.match(name):
                 continue          # skip non-VDI images (clonebase etc.)
             size = int(info.get("size", 0))
-            used = int(info.get("disk_usage", 0) or 0)
+            # total_disk_usage is the reliable allocation (the head-only disk_usage
+            # can read 0 when the object-map is stale); LocalBackend fills only
+            # disk_usage. Fall through so both backends report real per-VDI usage.
+            used = int(info.get("total_disk_usage") or info.get("disk_usage") or 0)
             md = info.get("metadata")
             # Self-heal: drop 'snap.<uuid>.*' meta left behind by snapshots that
             # no longer exist (a failed destroy, an out-of-band snap removal).
