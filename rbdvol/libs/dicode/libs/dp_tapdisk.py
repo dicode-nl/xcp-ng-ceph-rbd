@@ -65,6 +65,38 @@ def _tap_destroy(pid, minor):
     subprocess.check_call([TAP_CTL, "destroy", "-p", str(pid), "-m", str(minor)])
 
 
+def _escape_service_cgroup(dbg, pid):
+    """Place the tapdisk where XCP-ng's own tapdisks live, OUT of this
+    (xapi-storage-script) service's control-group. We create it from a
+    Datapath.attach plugin call, so tap-ctl spawns it as our child and it inherits
+    the storage-script cgroup. xapi-storage-script uses KillMode=control-group, so
+    restarting that daemon (our %post, or xe-toolstack-restart) SIGTERMs the whole
+    cgroup -- tearing down the tapdisk that serves a RUNNING guest's disk and
+    CRASHING the VM (the tapdisk then hangs in blktap_device_destroy_sync, the VBD
+    still open). A real host keeps tapdisks in cpu,blkio:/vm.slice,
+    memory:/control.slice, name=systemd:/control.slice/forkexecd.service (they are
+    forkexecd-spawned + cgclassify'd); match that. cgclassify moves the resource
+    controllers (as the canonical xapi.storage.libs.util.set_cgroup does); the
+    name=systemd hierarchy -- the one systemd kills on -- is moved by writing its
+    cgroup.procs. Best-effort: a failure just leaves the tapdisk where it was."""
+    try:
+        subprocess.call(
+            ["/usr/bin/cgclassify", "-g", "cpu,cpuacct:/vm.slice",
+             "-g", "blkio:/vm.slice", "-g", "memory:/control.slice", str(pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    except Exception as e:
+        log.debug("%s: cgclassify tapdisk %s failed: %s" % (dbg, pid, e))
+    for cg in ("/sys/fs/cgroup/systemd/control.slice/forkexecd.service/cgroup.procs",
+               "/sys/fs/cgroup/systemd/cgroup.procs"):    # forkexecd, else the root
+        try:
+            with open(cg, "w") as f:
+                f.write(str(pid))
+            return
+        except Exception as e:
+            log.debug("%s: tapdisk %s systemd move (%s) failed: %s"
+                      % (dbg, pid, cg, e))
+
+
 def attach(dbg, dconf, pool, ns, image, snap, dev):
     read_only = snap is not None
     cbtdev = None
@@ -85,6 +117,7 @@ def attach(dbg, dconf, pool, ns, image, snap, dev):
     # it so xapi's SXM nbd_export_of_attach_info finds a server on the dest.
     pid, minor = _tap_find(dev)
     if pid is not None and minor is not None:
+        _escape_service_cgroup(dbg, pid)   # survive a storage-script restart
         nbd_sock = "/run/blktap-control/nbd%s.%s" % (pid, minor)
         impls.append(["Nbd", {"uri": "nbd:unix:%s:exportname=%s"
                                      % (nbd_sock, image)}])
