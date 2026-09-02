@@ -6,7 +6,7 @@
 
 Name:           sm-additional-rbd
 Version:        2.0
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Ceph RBD Storage Repository driver for XCP-ng (native krbd + ceph-mgr dashboard API)
 
 License:        LGPL-2.1-only
@@ -86,6 +86,15 @@ if [ "$1" = "0" ]; then
 fi
 
 %changelog
+* Wed Sep 02 2026 dicode <info@dicode.nl> - 2.0-4
+- CBT (VDI_CONFIG_CBT): changed-block-tracking via rbd's native diff
+  (fast-diff/object-map) instead of the base class's tapdisk cbtlog chain.
+  Adds image_diff() on the RestBackend (dashboard /diff endpoint; degrades to
+  not_supported on an unpatched mgr) and rbd-native enable/disable/data_destroy/
+  list_changed_blocks on the VDI. Validated end-to-end with an XO NBD+CBT delta
+  backup (full 201M -> delta 21M for a 20MiB change). NOTE: this is a capability
+  change -- run 'xe-toolstack-restart' on every pool host after upgrading.
+
 * Thu Aug 27 2026 dicode <info@dicode.nl> - 2.0-3
 - GC: flatten a child only when it frees the parent snap (deep-flatten, or no
   child snapshots); otherwise defer (works on stock-rbd images w/o deep-flatten).
