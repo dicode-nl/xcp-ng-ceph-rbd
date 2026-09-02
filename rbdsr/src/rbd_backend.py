@@ -46,6 +46,12 @@ class RbdBackend(object):
         raise NotImplementedError
     def image_info(self, pool, image, namespace=""):
         raise NotImplementedError
+    def image_diff(self, pool, image, from_snap, to_snap, offset=0, length=None,
+                   whole_object=True, namespace=""):
+        """Changed extents between two states of an image (for CBT).
+        from_snap=None -> from image creation; to_snap=None -> the live head.
+        -> [{'offset','length','exists'}]. May raise not_supported."""
+        raise NotImplementedError
     def create(self, pool, image, size, features, namespace="", obj_size=None):
         raise NotImplementedError
     def remove(self, pool, image, namespace=""):
@@ -106,6 +112,7 @@ class RestBackend(RbdBackend):
         "GET /api/block/image": "2.0",
         "POST /api/block/image": "1.0",
         "GET /api/block/image/{spec}": "1.0",
+        "GET /api/block/image/{spec}/diff": "1.0",
         "PUT /api/block/image/{spec}": "1.0",
         "DELETE /api/block/image/{spec}": "1.0",
         "POST /api/block/image/{spec}/snap": "1.0",
@@ -250,6 +257,33 @@ class RestBackend(RbdBackend):
     def image_info(self, pool, image, namespace=""):
         return self._call("GET", "/api/block/image/%s" % self._spec(pool, image, namespace),
                           "GET /api/block/image/{spec}")
+
+    def image_diff(self, pool, image, from_snap, to_snap, offset=0, length=None,
+                   whole_object=True, namespace=""):
+        q = ["offset=%d" % int(offset),
+             "whole_object=%s" % ("true" if whole_object else "false")]
+        if from_snap:
+            q.append("from_snapshot=" + urllib.parse.quote(from_snap, safe=""))
+        if to_snap:
+            q.append("snapshot_name=" + urllib.parse.quote(to_snap, safe=""))
+        if length is not None:
+            q.append("length=%d" % int(length))
+        path = "/api/block/image/%s/diff?%s" % (self._spec(pool, image, namespace),
+                                                "&".join(q))
+        try:
+            bd = self._call("GET", path, "GET /api/block/image/{spec}/diff")
+        except RbdBackendError as e:
+            # A route-level 404 ("The path ... was not found") means this mgr
+            # lacks the rbd-diff patch -> surface as not_supported so CBT can
+            # degrade gracefully (vs a real image/snap not_found, which we keep).
+            if e.status == 404 and "the path" in str(e).lower():
+                raise RbdBackendError("dashboard has no /diff endpoint "
+                                      "(needs the ceph rbd-diff patch)",
+                                      status=404, not_supported=True)
+            raise
+        if isinstance(bd, dict):
+            return bd.get("diffs", []) or []
+        return bd or []
 
     def create(self, pool, image, size, features, namespace="", obj_size=None):
         body = {"pool_name": pool, "namespace": namespace or "", "name": image,

@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import json
+import base64
 import time
 import tempfile
 import subprocess
@@ -48,6 +49,7 @@ CAPABILITIES = [
     "VDI_GENERATE_CONFIG", "VDI_ATTACH_OFFLINE",
     "VDI_RESET_ON_BOOT/2",
     "VDI_REVERT",
+    "VDI_CONFIG_CBT",
 ]
 
 CONFIGURATION = [
@@ -88,6 +90,36 @@ DRIVER_CONFIG = {"ATTACH_FROM_CONFIG_WITH_TAPDISK": False}
 # use a non-UUID name so scan() ignores them.
 CLONE_SNAP_PREFIX = "xcp-clonebase-"
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+# --- CBT (changed block tracking) ---------------------------------------------
+# rbd-diff based, NOT the tapdisk cbtlog chain the base VDI class assumes: our
+# datapath is raw krbd ('phy', no tapdisk), so there is no cbtlog to walk. We
+# instead diff two rbd snapshots (fast-diff/object-map) via the dashboard and
+# render the changed extents into the XAPI 64 KiB bitmap. cbt_enabled itself is
+# tracked in XAPI's own VDI.cbt_enabled field (no rbd image-meta needed).
+CBT_BLOCK = 65536   # 64 KiB, the XAPI / NBD changed-block-tracking granularity
+
+
+def _changed_bitmap(diffs, offset, length, block=CBT_BLOCK):
+    """Turn rbd changed extents ([{offset,length,exists}, ...]) into the base64
+    bitmap that list_changed_blocks returns: one bit per <block> bytes over
+    [offset, offset+length), set when that block changed. Bit order is MSB-first
+    within each byte (block b -> byte b//8, bit 0x80>>(b%8)) -- the XenServer/XAPI
+    CBT convention (same helper as the SMAPIv3 rbd-vol driver, XO-validated)."""
+    length = int(length or 0)
+    nblocks = (length + block - 1) // block
+    bits = bytearray((nblocks + 7) // 8)
+    end = offset + length
+    for d in diffs or []:
+        if not d.get("exists"):
+            continue
+        s = max(int(d["offset"]), offset)
+        e = min(int(d["offset"]) + int(d["length"]), end)
+        if e <= s:
+            continue
+        for b in range((s - offset) // block, (e - 1 - offset) // block + 1):
+            bits[b // 8] |= 0x80 >> (b % 8)
+    return base64.b64encode(bytes(bits)).decode("ascii")
 
 # Async flatten-on-delete: an object with CoW children is renamed to a non-UUID
 # "xcp-trash-<uuid>" name (so scan() skips it) and handed to a detached rbd_gc.py
@@ -657,6 +689,13 @@ class CephRBDVDI(VDI.VDI):
         svdi.location = snap_uuid
         svdi.sm_config = {'vdi_type': self.vdi_type, 'snapshot_of': vdi_uuid,
                           'backend-kind': self.sr.backend_kind}
+        # CBT: a snapshot of a cbt-enabled base is itself a valid diff reference,
+        # so carry cbt_enabled onto it (list_changed_blocks diffs two such snaps).
+        try:
+            if self.sr.session.xenapi.VDI.get_cbt_enabled(svdi.snapshot_of):
+                svdi.cbt_enabled = True
+        except Exception:
+            pass
         try:
             svdi._db_introduce()
         except Exception as e:
@@ -679,6 +718,122 @@ class CephRBDVDI(VDI.VDI):
             self.sr.backend.snap_remove(self.sr.pool, base, snap, namespace=self.sr.namespace)
         except RbdBackendError:
             pass
+
+    # ---- CBT (changed block tracking) -------------------------------------
+    # The base VDI class implements CBT as a chain of tapdisk cbtlog files
+    # (blktap2 tap_pause + cbtutil). Our datapath is raw krbd ('phy', no
+    # tapdisk), so those don't apply -- we override the four CBT entrypoints to
+    # use rbd-diff instead. cbt_enabled lives in XAPI's own VDI.cbt_enabled
+    # field; the diff reference is the protected rbd snapshot behind each
+    # snapshot VDI (image==base uuid, snap==snapshot-VDI uuid).
+
+    def _get_blocktracking_status(self, uuid=None):
+        """CBT status for a VDI == its XAPI VDI.cbt_enabled field (we don't keep
+        cbtlog files). Overrides the base, which returns False for 'phy'/RAW."""
+        if not uuid:
+            uuid = self.uuid
+        try:
+            ref = self.session.xenapi.VDI.get_by_uuid(uuid)
+            return bool(self.session.xenapi.VDI.get_cbt_enabled(ref))
+        except Exception:
+            return False
+
+    def configure_blocktracking(self, sr_uuid, vdi_uuid, enable):
+        """Enable/disable CBT on a (non-snapshot) VDI. No cbtlog, no tap_pause:
+        we only gate on fast-diff being present and flip XAPI's cbt_enabled."""
+        vdi_ref = self.sr.srcmd.params['vdi_ref']
+        if self.session.xenapi.VDI.get_is_a_snapshot(vdi_ref):
+            raise xs_errors.XenError('VDIType',
+                                     opterr='snapshot VDI not permitted')
+        if self._get_blocktracking_status(vdi_uuid) == bool(enable):
+            return   # idempotent
+        if enable:
+            # rbd-diff needs fast-diff/object-map, else the diff is a full scan
+            # (or unsupported) and the bitmap would be unreliable.
+            image = self.sr._image_name(vdi_uuid)
+            try:
+                info = self.sr.backend.image_info(self.sr.pool, image,
+                                                  namespace=self.sr.namespace)
+            except RbdBackendError as e:
+                raise xs_errors.XenError('CBTActivateFailed', opterr=str(e))
+            feats = [f.lower() for f in (info.get('features_name') or [])]
+            if 'fast-diff' not in feats:
+                raise xs_errors.XenError(
+                    'CBTActivateFailed',
+                    opterr='image lacks fast-diff/object-map '
+                           '(create the SR/VDI with rbd_features=performance)')
+        self.session.xenapi.VDI.set_cbt_enabled(vdi_ref, bool(enable))
+
+    def data_destroy(self, sr_uuid, vdi_uuid):
+        """Free a CBT snapshot's data while keeping it as a diff reference. For
+        rbd there is no separate data to free -- the (protected) rbd snapshot IS
+        the diff baseline for future incrementals and MUST survive -- so this is
+        a no-op on the Ceph side. (The base calls delete(data_only=True), which
+        here would remove the rbd snapshot and break the CBT chain.) XAPI then
+        flips the VDI to cbt-metadata-only in its own DB."""
+        vdi_ref = self.sr.srcmd.params['vdi_ref']
+        if not self.session.xenapi.VDI.get_is_a_snapshot(vdi_ref):
+            raise xs_errors.XenError('VDIType',
+                                     opterr='Only allowed for snapshot VDIs')
+        util.SMlog("RBDVDI.data_destroy %s: keeping rbd snapshot as CBT reference"
+                   % vdi_uuid)
+
+    def _snap_ref(self, vdi_uuid):
+        """(base_image, snap_name) for a snapshot VDI uuid -- the rbd snapshot
+        that backs it. Prefers a loaded VDI object's fields, falls back to the
+        naming convention (image==parent uuid, snap==snapshot-VDI uuid)."""
+        v = self.sr.vdis.get(vdi_uuid)
+        if v is None:
+            v = self.sr.vdi(vdi_uuid)
+        parent = getattr(v, 'parent_uuid', None)
+        if not parent and getattr(v, 'sm_config', None):
+            parent = v.sm_config.get('snapshot_of')
+        base = self.sr._image_name(parent) if parent else (getattr(v, 'rbd_name', None) or vdi_uuid)
+        snap = getattr(v, 'snap_name', None) or self.sr._snap_name(vdi_uuid)
+        return base, snap
+
+    def list_changed_blocks(self):
+        """Changed 64 KiB blocks between two CBT snapshots, as the base64 bitmap
+        XAPI expects. rbd-diff (fast-diff) between the two protected rbd
+        snapshots replaces the base's cbtlog-chain walk."""
+        vdi_from = self.uuid
+        params = self.sr.srcmd.params
+        _VDI = self.session.xenapi.VDI
+        vdi_to = _VDI.get_uuid(params['args'][0])
+
+        if vdi_from == vdi_to:
+            raise xs_errors.XenError('CBTChangedBlocksError',
+                                     "Source and target VDI are same")
+        if not (self._get_blocktracking_status(vdi_from) and
+                self._get_blocktracking_status(vdi_to)):
+            raise xs_errors.XenError('CBTChangedBlocksError',
+                                     "CBT is not enabled on both VDIs")
+
+        from_base, from_snap = self._snap_ref(vdi_from)
+        to_base, to_snap = self._snap_ref(vdi_to)
+        if from_base != to_base:
+            raise xs_errors.XenError('CBTChangedBlocksError',
+                                     "Source and target VDI are unrelated")
+
+        try:
+            size = int(_VDI.get_virtual_size(params['args'][0]))
+        except Exception:
+            size = int(getattr(self, 'size', 0) or 0)
+
+        try:
+            diffs = self.sr.backend.image_diff(
+                self.sr.pool, from_base, from_snap, to_snap,
+                offset=0, length=size, whole_object=True,
+                namespace=self.sr.namespace)
+        except RbdBackendError as e:
+            if getattr(e, 'not_supported', False):
+                raise xs_errors.XenError(
+                    'CBTChangedBlocksError',
+                    "rbd-diff not available on the control plane: %s" % e)
+            raise xs_errors.XenError('CBTChangedBlocksError', str(e))
+
+        bitmap = _changed_bitmap(diffs, 0, size)
+        return xmlrpc.client.dumps((bitmap,), "", True)
 
     def clone(self, sr_uuid, vdi_uuid):
         util.SMlog("RBDVDI.clone of %s (snap=%s)" % (vdi_uuid, self.is_a_snapshot))
