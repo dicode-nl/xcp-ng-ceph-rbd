@@ -65,17 +65,20 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
         if mode == "tapdisk":
             impls = dp_tapdisk.attach(dbg, dconf, pool, ns, image, snap, dev)
         elif mode == "qemu":
-            impls = dp_qemu.attach(dbg, image, snap, dev)
+            impls = dp_qemu.attach(dbg, image, snap, dev, domain)
         else:
             impls = dp_blkback.attach(dbg, image, snap, dev, domain)
         return {"implementations": impls}
 
     def detach(self, dbg, uri, domain):
         dconf, pool, ns, image, snap, mode = _resolve(uri)
+        do_unmap = True
         if mode == "tapdisk":
             dp_tapdisk.detach(dbg, dconf, pool, ns, image, snap)
         elif mode == "qemu":
-            dp_qemu.detach(dbg, image)
+            # Refcounted: unmap /dev/rbdN only when the LAST consumer detaches
+            # (the storage-daemon holds it open until then).
+            do_unmap = dp_qemu.detach(dbg, image, domain)
         else:
             # A blkback SXM source parks its pre-copy mirror on the image; this
             # detach is the cutover window (measured guest-paused, pre-dest-
@@ -91,10 +94,11 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
                 else:
                     blkmirror.cancel(dbg, dconf, pool, ns, image)
             dp_blkback.detach(dbg, image)
-        try:
-            rbd_sysfs.unmap_image(pool, image, snap=snap, namespace=ns)
-        except rbd_sysfs.RbdMapError as e:
-            log.debug("%s: Datapath.detach unmap warning: %s" % (dbg, e))
+        if do_unmap:
+            try:
+                rbd_sysfs.unmap_image(pool, image, snap=snap, namespace=ns)
+            except rbd_sysfs.RbdMapError as e:
+                log.debug("%s: Datapath.detach unmap warning: %s" % (dbg, e))
 
     # The device is live for the whole attach/detach bracket; per-domain
     # activate/deactivate are no-ops for every mode.

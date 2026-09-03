@@ -22,17 +22,23 @@ def _export(image):
     return str(image).replace("-", "")
 
 
-def attach(dbg, image, snap, dev):
+def attach(dbg, image, snap, dev, domain):
     """Return the SMAPIv3 implementations for the qemu serve mode. BlockDevice
     wins in xenopsd's params_of_backend (params=/dev/nbdX, backend-kind=vbd ->
     blkback serves the guest); the Nbd impl is the SXM handle (receive_start3
-    reads its exportname, and DATA.get_nbd_server hands xapi this same socket)."""
+    reads its exportname, and DATA.get_nbd_server hands xapi this same socket).
+
+    One image can be attached by several consumers (an SXM receive's mirror dp +
+    the guest's activate); we refcount on the domain so the qsd+nbd are built once
+    and shared, and only the LAST detach tears them down (qsd.start/nbd_attach are
+    idempotent)."""
     read_only = snap is not None
     export = _export(image)
+    qsd.ref_add(dbg, image, domain)
     sock = qsd.start(dbg, image, dev, export, read_only=read_only)
     nbddev = qsd.nbd_attach(dbg, image, export)
-    log.debug("%s: attach %s -> qsd nbd %s over %s (blkback)"
-              % (dbg, image, nbddev, dev))
+    log.debug("%s: attach %s -> qsd nbd %s over %s (blkback, dom=%s)"
+              % (dbg, image, nbddev, dev, domain))
     return [
         ["XenDisk", {"backend_type": "vbd", "params": nbddev, "extra": {}}],
         ["BlockDevice", {"path": nbddev}],
@@ -81,15 +87,24 @@ def drain_mirror(dbg, image):
         log.debug("%s: drain_mirror(%s) failed: %s" % (dbg, image, e))
 
 
-def detach(dbg, image):
-    """Tear down the nbd device + storage-daemon (must run BEFORE the caller
-    unmaps /dev/rbdN, which the daemon holds open). First drain any live SXM
-    mirror so no writes are lost, then qsd.stop waits for the daemon to exit."""
+def detach(dbg, image, domain):
+    """Drop this consumer's ref and, only when it was the LAST, tear down the nbd
+    device + storage-daemon. Returns True iff it tore down (so the caller unmaps
+    /dev/rbdN only then -- the daemon holds it open until stopped).
+
+    The mirror drain runs on EVERY detach (it is a no-op unless a mirror job is
+    live): the SXM source's mirror-dp detach is the measured guest-paused,
+    pre-dest-resume cutover, and with refcounting it is NOT the last ref (the
+    guest still holds one) -- so we drain the mirror there without killing the
+    qsd the guest is still being served by (that hard-kill was the old crash)."""
     drain_mirror(dbg, image)
+    if qsd.ref_del(dbg, image, domain) > 0:
+        return False                                 # other consumers remain
     try:
         qsd.stop(dbg, image)
     except Exception as e:
         log.debug("%s: qsd stop failed: %s" % (dbg, e))
+    return True
 
 
 def get_nbd_server(dbg, image):
@@ -111,6 +126,10 @@ def mirror(dbg, image, remote):
     proxy_sock = urllib.parse.parse_qs(u.query).get("socket", [""])[0]
     job = "m_" + export[:32]
     with qsd.Qmp(dbg, image) as q:
+        try:                                         # drop a stale 'dst' node
+            q.cmd("blockdev-del", **{"node-name": "dst"})
+        except Exception:                            # left by an earlier mirror
+            pass                                     # (none present -> fine)
         q.cmd("blockdev-add", **{
             "driver": "nbd", "node-name": "dst",
             "server": {"type": "unix", "path": proxy_sock},
@@ -134,7 +153,7 @@ def stat(dbg, key):
             jobs = q.cmd("query-block-jobs").get("return", [])
     except Exception as e:
         log.debug("%s: stat %s qmp error: %s" % (dbg, key, e))
-        return {"failed": True, "complete": False, "progress": None}
+        return {"failed": True, "complete": False, "progress": 0.0}
     for j in jobs or []:
         if j.get("device") == job or j.get("id") == job:
             ln = j.get("len") or 0
@@ -145,4 +164,4 @@ def stat(dbg, key):
             return {"failed": bool(failed), "complete": bool(j.get("ready")),
                     "progress": prog}
     log.debug("%s: stat %s: job absent -> failed" % (dbg, key))
-    return {"failed": True, "complete": False, "progress": None}
+    return {"failed": True, "complete": False, "progress": 0.0}

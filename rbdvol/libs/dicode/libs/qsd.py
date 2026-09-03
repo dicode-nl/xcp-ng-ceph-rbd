@@ -156,13 +156,78 @@ def _persist_nbd_info(dev, sock, export):
         f.write(json.dumps({"path": sock, "exportname": export}))
 
 
+# ---- attach refcount (one qsd+nbd shared across an image's attaches) ----
+# Datapath.attach/detach are called once PER CONSUMER of a VDI: on an SXM RECEIVE
+# receive_start3 attaches (vm=MIR...) AND the guest activates (vm=<domid>); an SXM
+# SOURCE has the guest attach + the mirror dp attach. Without accounting, each
+# attach wired a fresh /dev/nbdX (leak) and the FIRST detach tore the whole qsd
+# down under a still-attached guest (I/O error / crash). We key a ref on the
+# domain so the qsd+nbd are built once and torn down only when the LAST consumer
+# detaches.
+
+def _refs_dir(image):
+    return os.path.join(_RUN, image, "refs")
+
+
+def _ref_token(domain):
+    return str(domain).replace("/", "_") or "none"
+
+
+def ref_add(dbg, image, domain):
+    d = _refs_dir(image)
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, _ref_token(domain)), "w").close()
+    n = len(os.listdir(d))
+    log.debug("%s: qsd ref+ %s dom=%s -> %d" % (dbg, image, domain, n))
+    return n
+
+
+def ref_del(dbg, image, domain):
+    """Drop this domain's ref; return the number of refs still held (0 => the
+    caller should tear the qsd down)."""
+    d = _refs_dir(image)
+    try:
+        os.unlink(os.path.join(d, _ref_token(domain)))
+    except OSError:
+        pass
+    try:
+        n = len(os.listdir(d))
+    except OSError:
+        n = 0
+    log.debug("%s: qsd ref- %s dom=%s -> %d" % (dbg, image, domain, n))
+    return n
+
+
+def _nbd_wired_to(dev, sock):
+    """True if [dev] is a live nbd-client connection to THIS qsd's [sock] (per the
+    /var/run/nonpersistent/nbd/<N> connect-info) -- safe to reuse on a repeat
+    attach."""
+    try:
+        num = os.path.basename(dev)[len("nbd"):]
+        if not os.path.exists("/sys/block/nbd%s/pid" % num):
+            return False
+        with open(os.path.join(_PERSIST_DIR, num)) as f:
+            return json.load(f).get("path") == sock
+    except Exception:
+        return False
+
+
 def nbd_attach(dbg, image, export):
     """Wire the storage-daemon's unix NBD export to a free /dev/nbdX. Prefer xapi's
     nbd_client_manager.py -- it writes the /var/run/nonpersistent/nbd/<N> info file
     that vhd-tool needs (so VDI.copy TO this SR works) and holds xapi's device
-    lock. Returns the device path and remembers it for detach."""
+    lock. Returns the device path and remembers it for detach.
+
+    Idempotent: a repeat attach for the same image (second consumer) reuses the
+    device already wired to this qsd rather than allocating -- and leaking -- a
+    second one. Safe because teardown is refcounted (ref_del), so the shared
+    device is only disconnected when the last consumer detaches."""
     _ensure_nbd_module()
     sock = nbd_sock(image)
+    existing = find_nbd(image)
+    if existing and _nbd_wired_to(existing, sock):
+        log.debug("%s: qsd nbd_attach %s -> reuse %s" % (dbg, image, existing))
+        return existing
     if os.path.exists(NBD_MANAGER):
         dev = subprocess.check_output(
             [NBD_MANAGER, "connect", "--path", sock, "--exportname", export],
@@ -254,6 +319,13 @@ def stop(dbg, image):
             os.unlink(p)
         except OSError:
             pass
+    d = _refs_dir(image)                              # drop any leftover refs
+    try:
+        for t in os.listdir(d):
+            os.unlink(os.path.join(d, t))
+        os.rmdir(d)
+    except OSError:
+        pass
     try:
         os.rmdir(_dir(image))
     except OSError:
