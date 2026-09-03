@@ -46,8 +46,10 @@ data path (krbd map) is unchanged either way.
   `LocalBackend` (librbd/librados); `make_backend()` selects on `backend=`.
 - `rbd_sysfs.py` — the krbd map/unmap datapath.
 - `dp_blkback.py` / `dp_tapdisk.py` / `dp_qemu.py` — the three serve modes.
-- `qsd.py` — qemu-storage-daemon control (qemu mode); `blknbd.py` — qemu-nbd over
-  /dev/rbdN (blkback SXM-receive).
+- `qsd.py` — qemu-storage-daemon control (qemu mode; refcounted per-image attach);
+  `blknbd.py` — qemu-nbd over /dev/rbdN (blkback SXM-receive).
+- `blkmirror.py` + `rbd_blkmir.py` — blkback SXM **source**: the iterative rbd-diff
+  pre-copy control + its detached worker.
 - `cbtlog.py` — tapdisk CBT log; `gcjob.py` + `rbd_gc.py` — async flatten GC;
   `rbdvol_lib.py` — shared helpers.
 

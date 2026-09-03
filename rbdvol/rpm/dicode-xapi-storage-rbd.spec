@@ -15,7 +15,7 @@
 # (cf. xcp-ng-xapi-storage-{libs,volume-zfsvol,datapath-tapdisk}) plus a thin meta.
 Name:           dicode-xapi-storage-rbd
 Version:        0.2
-Release:        5%{?dist}
+Release:        6%{?dist}
 Summary:        Ceph RBD SMAPIv3 storage plugin for XCP-ng (meta: libs + volume + datapath)
 
 License:        LGPL-2.1-only
@@ -155,6 +155,24 @@ echo "      (VDI_MIRROR/VDI_MIRROR_IN only promote once every host has re-regist
 systemctl try-restart --no-block xapi-storage-script.service >/dev/null 2>&1 || :
 
 %changelog
+* Wed Sep 03 2026 dicode <info@dicode.nl> - 0.2-6
+- blkback SXM SOURCE: the native (max-perf) blkback mode can now be live-migrated
+  OFF an SR, not just onto one. Since kernel blkback can't tee live writes,
+  DATA.mirror runs an iterative rbd-diff PRE-COPY (new dicode.libs.blkmirror +
+  worker rbd_blkmir.py): snapshot -> copy only changed 4MiB objects to the dest
+  over NBD -> repeat to convergence (sxm_threshold, default 256MiB / sxm_max_iters,
+  default 8), then the final delta in the guest-paused cutover. Validated static +
+  actively-writing (fio --verify through the cutover), md5-identical.
+- qemu datapath: REFCOUNT the per-VDI qsd+nbd across attaches. One VDI is attached
+  by several consumers (SXM receive's mirror-dp + the guest); the old code wired a
+  fresh /dev/nbdX per attach (leaking the earlier one) and the FIRST detach killed
+  the whole daemon under the still-attached guest (I/O error). Now one qsd+nbd is
+  shared and torn down only at the last detach; unmap gated likewise.
+- Harden mirror-failure cleanup so an abort leaves no orphans: sweep ALL xcp-sxm-*
+  snapshots (not just the baseline); blockdev-del a stale 'dst' mirror node (fixes
+  "Duplicate nodes with node-name='dst'" on a re-mirror); Volume.destroy releases
+  local holders + retries once on 'RBD image is busy'.
+
 * Mon Sep 01 2026 dicode <info@dicode.nl> - 0.2-5
 - Fix VM crash on a storage-script restart with a tapdisk-mode disk: our tapdisks
   were spawned into the xapi-storage-script control-group, so a restart of that
