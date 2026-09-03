@@ -7,7 +7,9 @@
 # query; default blkback). The three are serve MODES of the one rbd datapath,
 # not separate datapaths -- the underlying storage access is always rbd:
 #   * blkback  -> hand xenopsd the raw /dev/rbdN (backend_type "vbd"): kernel
-#                 blkback, tapdisk-less, max performance, no SXM.
+#                 blkback, tapdisk-less, max performance. SXM source via an
+#                 iterative rbd-diff pre-copy (dicode.libs.blkmirror); SXM dest
+#                 via a lazily-started qemu-nbd (dicode.libs.blknbd).
 #   * tapdisk  -> a userspace tapdisk (backend_type "vbd3"): unlocks CBT and the
 #                 tapdisk NBD mirror (dicode.libs.dp_tapdisk).
 #   * qemu     -> a per-VDI qemu-storage-daemon behind blkback (dicode.libs.
@@ -31,6 +33,7 @@ from dicode.libs import rbd_sysfs
 from dicode.libs import dp_blkback
 from dicode.libs import dp_tapdisk
 from dicode.libs import dp_qemu
+from dicode.libs import blkmirror
 
 
 def _parse_uri(uri):
@@ -74,6 +77,19 @@ class Implementation(xapi.storage.api.v5.datapath.Datapath_skeleton):
         elif mode == "qemu":
             dp_qemu.detach(dbg, image)
         else:
+            # A blkback SXM source parks its pre-copy mirror on the image; this
+            # detach is the cutover window (measured guest-paused, pre-dest-
+            # resume). Ship the final delta if the pre-copy converged, else tear
+            # down a failed/aborted migration. MUST run before the unmap below
+            # (the final delta reads source snapshots; the base map is the
+            # guest's and stays busy). Idempotent: only the first such detach
+            # finalizes.
+            if blkmirror.active(image):
+                st = blkmirror.read_status(image)
+                if st.get("complete") and not st.get("failed"):
+                    blkmirror.finalize(dbg, dconf, pool, ns, image)
+                else:
+                    blkmirror.cancel(dbg, dconf, pool, ns, image)
             dp_blkback.detach(dbg, image)
         try:
             rbd_sysfs.unmap_image(pool, image, snap=snap, namespace=ns)
@@ -120,20 +136,26 @@ class DataImplementation(xapi.storage.api.v5.datapath.Data_skeleton):
         return dp_blkback.get_nbd_server(dbg, pool, ns, image, snap)
 
     def mirror(self, dbg, uri, domain, remote):
-        _dconf, pool, ns, image, snap, mode = _resolve(uri)
+        dconf, pool, ns, image, snap, mode = _resolve(uri)
         if mode == "qemu":
             return dp_qemu.mirror(dbg, image, remote)
-        # SXM SOURCE requires a race-free base copy + live tee, which only the
-        # qemu mode does (blockdev-mirror). The tapdisk fd-passing mirror tees
-        # NEW writes but NOT the base, so it would silently lose pre-existing
-        # data -- it is deliberately NOT wired (dp_tapdisk.mirror stays as unwired
-        # WIP). blkback cannot tee at all. Fail loudly rather than corrupt.
+        if mode == "blkback":
+            # blkback can't tee live writes, so instead of a qemu-style base-copy
+            # + tee we run an iterative rbd-diff pre-copy (converge, then a final
+            # delta in the paused cutover at Datapath.detach). See blkmirror.
+            return blkmirror.mirror(dbg, dconf, pool, ns, image, remote)
+        # The tapdisk fd-passing mirror tees NEW writes but NOT the base, so it
+        # would silently lose pre-existing data -- deliberately NOT wired
+        # (dp_tapdisk.mirror stays as unwired WIP). Fail loudly rather than
+        # corrupt.
         raise xapi.storage.api.v5.datapath.Unimplemented(
-            "DATA.mirror (SXM source) requires the qemu datapath mode (got %s)"
+            "DATA.mirror (SXM source) not supported for the %s datapath mode"
             % mode)
 
     def stat(self, dbg, operation):
         key = operation[1] if isinstance(operation, (list, tuple)) else operation
+        if key.startswith(blkmirror.HANDLE_PREFIX):  # "blkmir:<image>"
+            return blkmirror.stat(dbg, key)
         if "|" in key:                               # qemu handle "<image>|<job>"
             return dp_qemu.stat(dbg, key)
         return dp_tapdisk.stat(dbg, key)             # tapdisk "<pid>.<minor>"

@@ -6,8 +6,10 @@
 # blkback serves the guest directly -- no userspace process in the data path,
 # maximum performance. To also be an SXM DESTINATION, a qemu-nbd over /dev/rbdN
 # provides a writable NBD (dicode.libs.blknbd), started LAZILY in get_nbd_server
-# so the normal guest attach stays pure blkback. blkback cannot be an SXM source
-# (it can't tee live writes); use the qemu mode for that.
+# so the normal guest attach stays pure blkback. blkback cannot TEE live writes,
+# so it is an SXM source via an iterative rbd-diff pre-copy instead of a live
+# mirror (dicode.libs.blkmirror, wired in DATA.mirror + the paused final delta in
+# Datapath.detach) -- not this file.
 
 from xapi.storage import log
 

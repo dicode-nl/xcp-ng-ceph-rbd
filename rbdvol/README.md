@@ -60,14 +60,20 @@ A *parameter* (`device-config:datapath=`, or per-VDI `?dp=`), not separate
 plugins — the underlying access is always native krbd (`/dev/rbdN`):
 
 - **blkback** (default) → raw `/dev/rbdN` via kernel blkback (`backend_type vbd`),
-  tapdisk-less, max performance. Can be an SXM **destination** (a qemu-nbd over
-  /dev/rbdN, started only during a receive); **not** an SXM source.
+  tapdisk-less, max performance. A full SXM peer: **destination** via a qemu-nbd
+  over /dev/rbdN (started only during a receive), and **source** via an iterative
+  rbd-diff pre-copy (`dicode.libs.blkmirror`) — snapshot the live image, copy only
+  the objects `rbd diff` reports changed to the dest over NBD, repeat until a pass
+  falls under `sxm_threshold` (default 256 MiB) or `sxm_max_iters` (default 8),
+  then ship the final delta in the guest-paused cutover window (`Datapath.detach`).
+  No userspace hop in the guest data path.
 - **tapdisk** → `tap-ctl create aio:/dev/rbdN` (`backend_type vbd3`) — the
   "accepted" xcp-ng path; unlocks CBT via `cbtlog`.
 - **qemu** → a per-VDI **qemu-storage-daemon** exports /dev/rbdN over NBD, wired to
   /dev/nbdX and served by blkback. Its `blockdev-mirror` does a race-free full copy
-  + live tee — the SXM **source** engine (`DATA.mirror`), so a qemu-mode disk can be
-  live-migrated (intra- or cross-host) onto any rbd-vol SR.
+  + live tee — an SXM **source** engine (`DATA.mirror`) with a continuous mirror.
+  Both qemu and blkback modes can be live-migrated (intra- or cross-host) onto any
+  rbd-vol SR; tapdisk is not an SXM source.
 
 ## Data model & device-config
 
@@ -118,5 +124,9 @@ discovered by directory.
 Done + validated on XCP-ng 8.3: SR + full VDI lifecycle, async GC, image-meta, all
 three datapath modes, a full root-on-`rbd-vol` VM boot, CBT, and live storage
 migration (SXM) — intra-host and **cross-host** (VM node->node while a qemu-mode
-disk moves to another rbd-vol SR), byte-for-byte verified. `xe vdi-copy`/offline
-move onto a qemu-mode SR works too. See `../rbdsr` for the SMAPIv1 lineage.
+disk moves to another rbd-vol SR), byte-for-byte verified. Both the **qemu**
+(blockdev-mirror) and the **blkback** (rbd-diff pre-copy) modes are validated SXM
+sources — the blkback source checked byte-for-byte on a static disk and with an
+actively-writing guest (continuous `fio --verify` through the cutover, zero
+errors). `xe vdi-copy`/offline move onto a qemu-mode SR works too. See `../rbdsr`
+for the SMAPIv1 lineage.
