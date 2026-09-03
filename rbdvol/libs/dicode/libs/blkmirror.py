@@ -317,6 +317,28 @@ def _stop_worker(image, timeout=120):
         pass
 
 
+def _sweep_sxm_snaps(dconf, pool, ns, image, be=None):
+    """Remove EVERY leftover xcp-sxm-* snapshot on the image, not just the one
+    recorded as the baseline: a worker killed between snap_create and its status
+    write, or an intermediate pass, can leave strays that would otherwise
+    accumulate on the (surviving) source image. Best-effort; only touches our own
+    SNAP_PREFIX snapshots."""
+    try:
+        be = be or make_backend(dconf)
+        info = be.image_info(pool, image, namespace=ns)
+    except Exception as e:
+        _log("sweep %s: image_info failed: %s" % (image, e))
+        return
+    for s in info.get("snapshots", []) or []:
+        name = s.get("name") or ""
+        if name.startswith(SNAP_PREFIX):
+            try:
+                be.snap_remove(pool, image, name, namespace=ns)
+                _log("sweep removed %s@%s" % (image, name))
+            except Exception as e:
+                _log("sweep snap_remove %s@%s: %s" % (image, name, e))
+
+
 def finalize(dbg, dconf, pool, ns, image):
     """Cutover (guest PAUSED): stop the pre-copy, ship the final delta since the
     last baseline snapshot, then tear everything down. Idempotent -- the first
@@ -337,13 +359,7 @@ def finalize(dbg, dconf, pool, ns, image):
         _log("%s: finalize %s copied final delta %d bytes (baseline=%s)"
              % (dbg, image, n, baseline))
     finally:
-        for s in (final_snap, baseline):
-            if s:
-                try:
-                    be.snap_remove(pool, image, s, namespace=ns)
-                except Exception as e:
-                    _log("finalize snap_remove %s@%s warning: %s"
-                         % (image, s, e))
+        _sweep_sxm_snaps(dconf, pool, ns, image, be)   # final + baseline + strays
         _nbd_disconnect(nbd_dev)
         _rmstate(image)
 
@@ -353,19 +369,13 @@ def cancel(dbg, dconf, pool, ns, image):
     snapshot, disconnect the dest NBD, remove state. Best-effort/idempotent."""
     if not active(image):
         return
-    st = read_status(image)
     _stop_worker(image, timeout=30)
-    baseline = st.get("baseline_snap")
     try:
         job = _read_job(image)
         _nbd_disconnect(job.get("nbd_dev"))
     except Exception:
         pass
-    if baseline:
-        try:
-            make_backend(dconf).snap_remove(pool, image, baseline, namespace=ns)
-        except Exception as e:
-            _log("cancel snap_remove %s@%s warning: %s" % (image, baseline, e))
+    _sweep_sxm_snaps(dconf, pool, ns, image)   # baseline + any worker strays
     _rmstate(image)
     _log("%s: mirror %s cancelled" % (dbg, image))
 

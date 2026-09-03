@@ -54,11 +54,17 @@ def drain_mirror(dbg, image):
     with no new writes and no race with the resumed dest guest. Without this, the
     async mirror job would be hard-killed with the last writes still un-copied
     (silent data loss for an actively-writing guest). No-op if there is no job."""
+    def _del_dst(q):
+        try:                                         # drop the mirror target node
+            q.cmd("blockdev-del", **{"node-name": "dst"})
+        except Exception:                            # (absent after a normal
+            pass                                     # migration -> fine)
     try:
         with qsd.Qmp(dbg, image) as q:
             jobs = q.cmd("query-block-jobs").get("return", [])
             job = next((j for j in jobs if j.get("type") == "mirror"), None)
             if not job:
+                _del_dst(q)                          # sweep a stale target node
                 return
             jid = job.get("device") or job.get("id")
             for _ in range(600):                     # wait until 'ready' (~60s)
@@ -66,7 +72,8 @@ def drain_mirror(dbg, image):
                 m = next((j for j in jobs
                           if (j.get("device") or j.get("id")) == jid), None)
                 if m is None:
-                    return                           # gone -> already finished
+                    _del_dst(q)                      # gone -> already finished
+                    return
                 if m.get("ready"):
                     break
                 time.sleep(0.1)
@@ -79,10 +86,12 @@ def drain_mirror(dbg, image):
                 if not any((j.get("device") or j.get("id")) == jid
                            for j in jobs):
                     log.debug("%s: mirror %s drained + completed" % (dbg, image))
-                    return
+                    break
                 time.sleep(0.1)
-            log.debug("%s: mirror %s did not finish draining in time"
-                      % (dbg, image))
+            else:
+                log.debug("%s: mirror %s did not finish draining in time"
+                          % (dbg, image))
+            _del_dst(q)                              # remove the target node
     except Exception as e:
         log.debug("%s: drain_mirror(%s) failed: %s" % (dbg, image, e))
 
@@ -135,9 +144,17 @@ def mirror(dbg, image, remote):
             "server": {"type": "unix", "path": proxy_sock},
             "export": export,
         })
-        q.cmd("blockdev-mirror", **{
-            "job-id": job, "device": qsd.NODE, "target": "dst", "sync": "full",
-        })
+        try:
+            q.cmd("blockdev-mirror", **{
+                "job-id": job, "device": qsd.NODE, "target": "dst",
+                "sync": "full",
+            })
+        except Exception:                            # don't leak the target node
+            try:
+                q.cmd("blockdev-del", **{"node-name": "dst"})
+            except Exception:
+                pass
+            raise
     log.debug("%s: mirror %s export=%s job=%s" % (dbg, image, export, job))
     return ["MirrorV1", "%s|%s" % (image, job)]
 

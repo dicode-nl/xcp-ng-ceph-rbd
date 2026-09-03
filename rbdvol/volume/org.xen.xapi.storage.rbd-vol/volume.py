@@ -8,6 +8,7 @@
 
 import os
 import sys
+import time
 import uuid
 
 import xapi.storage.api.v5.volume
@@ -72,6 +73,24 @@ def _force_release(dbg, pool, ns, image):
             rbd_sysfs.unmap_image(pool, image, force=True, namespace=ns)
     except Exception as e:
         log.debug("%s: force_release unmap %s: %s" % (dbg, image, e))
+
+
+def _release_and_remove(dbg, be, pool, ns, image):
+    """Drop local holders (blknbd/qsd + krbd map) then delete the base image. If
+    the delete still fails 'RBD image is busy' -- a watcher from a just-killed
+    client not yet timed out -- release again, wait, and retry ONCE before giving
+    up. A failed/aborted SXM is the usual reason a dest leaf is still held."""
+    _force_release(dbg, pool, ns, image)
+    try:
+        be.remove(pool, image, namespace=ns)
+    except RbdBackendError as e:
+        if e.not_found:
+            return
+        log.debug("%s: remove %s failed (%s); re-releasing + retrying" %
+                  (dbg, image, e))
+        _force_release(dbg, pool, ns, image)
+        time.sleep(3)                                # let a stale watcher lapse
+        be.remove(pool, image, namespace=ns)         # a 2nd failure propagates
 
 
 def _snap_has_children(be, pool, ns, base_image, snap_name):
@@ -198,11 +217,9 @@ class Implementation(xapi.storage.api.v5.volume.Volume_skeleton):
                     else:
                         for s in snaps:    # childless snapshots: unprotect + remove
                             _remove_snap(be, pool, ns, base, s.get("name"))
-                        _force_release(dbg, pool, ns, base)
-                        be.remove(pool, base, namespace=ns)
+                        _release_and_remove(dbg, be, pool, ns, base)
                 else:
-                    _force_release(dbg, pool, ns, base)
-                    be.remove(pool, base, namespace=ns)
+                    _release_and_remove(dbg, be, pool, ns, base)
         except RbdBackendError as e:
             if not e.not_found:
                 raise Exception("VDI destroy failed: %s" % e)
